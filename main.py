@@ -957,7 +957,7 @@ def ask_ai(messages):
                 elif e.status == 429:
                     pause(key, 180, "rate or credit limit")
                 else:
-                    pause(key, 120, f"HTTP {e.status}")
+                    pause(key, 120, str(e))           # includes the provider's error text, e.g. "model not found"
             except AuthError as e:
                 if route["kind"] == "codebuddy":
                     pause(f"acct:codebuddy-{route['account']}", 900, str(e))
