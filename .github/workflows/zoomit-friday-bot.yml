@@ -1,0 +1,75 @@
+name: zoomit-friday-bot
+
+# Chain: every run stops itself after RUN_LIMIT_MINUTES (default 345),
+# then starts the next run. The cron is only a safety net if the chain ever breaks.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */5 * * *"
+
+permissions:
+  contents: read
+  actions: write            # needed to start the next run
+
+# One run at a time. At most one pending run, so the chain never duplicates.
+concurrency:
+  group: zoomit-friday-bot
+  cancel-in-progress: false
+
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355    # GitHub hard limit for a job is 360 minutes
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests cryptography
+
+      - name: Restore bot state (encrypted)
+        uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: zoomit-state-${{ github.run_id }}
+          restore-keys: |
+            zoomit-state-
+
+      - name: Run bot
+        env:
+          PLATFORM: ${{ vars.PLATFORM || 'zoomit' }}
+          DRY_RUN: ${{ vars.DRY_RUN || 'false' }}
+          RUN_LIMIT_MINUTES: ${{ vars.RUN_LIMIT_MINUTES || '345' }}
+          IMAGE_MODEL: ${{ vars.IMAGE_MODEL || 'flux' }}
+          CODEBUDDY_CHAT_URL: ${{ vars.CODEBUDDY_CHAT_URL }}
+          CODEBUDDY_EXTRA_HEADERS: ${{ vars.CODEBUDDY_EXTRA_HEADERS }}
+          AI_BASE_URL: ${{ vars.AI_BASE_URL }}
+          ZOOMIT_REFRESH_TOKEN: ${{ secrets.ZOOMIT_REFRESH_TOKEN }}
+          CODEBUDDY_REFRESH_TOKENS: ${{ secrets.CODEBUDDY_REFRESH_TOKENS }}
+          STATE_KEY: ${{ secrets.STATE_KEY }}
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          POLLINATIONS_API_KEY: ${{ secrets.POLLINATIONS_API_KEY }}
+          ZOOMIT_TEAM_INFO: ${{ secrets.ZOOMIT_TEAM_INFO }}
+          MEMORY_MESSAGES: ${{ vars.MEMORY_MESSAGES || '10' }}
+          SEARCH_PROVIDER: ${{ vars.SEARCH_PROVIDER || 'serpapi' }}
+          SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          NOTIF_READ_TEMPLATE: ${{ vars.NOTIF_READ_TEMPLATE }}
+          NOTIF_READ_AUTODISCOVER: ${{ vars.NOTIF_READ_AUTODISCOVER || 'true' }}
+        run: python main.py
+
+      - name: Save bot state (encrypted)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data
+          key: zoomit-state-${{ github.run_id }}
+
+      - name: Start the next run
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run zoomit-friday-bot.yml --ref "$GITHUB_REF_NAME"
