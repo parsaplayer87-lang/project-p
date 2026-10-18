@@ -43,7 +43,7 @@ jobs:
           PLATFORM: ${{ vars.PLATFORM || 'zoomit' }}
           DRY_RUN: ${{ vars.DRY_RUN || 'false' }}
           RUN_LIMIT_MINUTES: ${{ vars.RUN_LIMIT_MINUTES || '345' }}
-          IMAGE_MODEL: ${{ vars.IMAGE_MODEL || 'flux' }}
+          IMAGE_MODEL: ${{ vars.IMAGE_MODEL || 'black-forest-labs/flux.1-schnell' }}
           CODEBUDDY_CHAT_URL: ${{ vars.CODEBUDDY_CHAT_URL }}
           CODEBUDDY_EXTRA_HEADERS: ${{ vars.CODEBUDDY_EXTRA_HEADERS }}
           AI_BASE_URL: ${{ vars.AI_BASE_URL }}
