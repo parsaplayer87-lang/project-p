@@ -47,6 +47,23 @@ jobs:
           restore-keys: |
             zoomit-state-
 
+      - name: Config check (prints yes or no only, never values)
+        env:
+          V_AI_BASE_URL: ${{ vars.AI_BASE_URL }}
+          S_AI_BASE_URL: ${{ secrets.AI_BASE_URL }}
+          S_AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          S_ZOOMIT: ${{ secrets.ZOOMIT_REFRESH_TOKEN }}
+          S_CODEBUDDY: ${{ secrets.CODEBUDDY_REFRESH_TOKENS }}
+          S_STATE_KEY: ${{ secrets.STATE_KEY }}
+        run: |
+          yn() { if [ -n "$1" ]; then echo yes; else echo no; fi; }
+          echo "variable AI_BASE_URL set: $(yn "$V_AI_BASE_URL")"
+          echo "secret AI_BASE_URL set: $(yn "$S_AI_BASE_URL")"
+          echo "secret AI_API_KEY set: $(yn "$S_AI_API_KEY")"
+          echo "secret ZOOMIT_REFRESH_TOKEN set: $(yn "$S_ZOOMIT")"
+          echo "secret CODEBUDDY_REFRESH_TOKENS set: $(yn "$S_CODEBUDDY")"
+          echo "secret STATE_KEY set: $(yn "$S_STATE_KEY")"
+
       - name: Run bot
         env:
           PLATFORM: ${{ vars.PLATFORM || 'zoomit' }}
@@ -55,8 +72,8 @@ jobs:
           IMAGE_MODEL: ${{ vars.IMAGE_MODEL || 'flux' }}
           CODEBUDDY_CHAT_URL: ${{ vars.CODEBUDDY_CHAT_URL }}
           CODEBUDDY_EXTRA_HEADERS: ${{ vars.CODEBUDDY_EXTRA_HEADERS }}
-          AI_BASE_URL: ${{ vars.AI_BASE_URL }}
-          AI_MODELS: ${{ vars.AI_MODELS }}
+          AI_BASE_URL: ${{ vars.AI_BASE_URL || secrets.AI_BASE_URL }}
+          AI_MODELS: ${{ vars.AI_MODELS || secrets.AI_MODELS }}
           FORCE_IPV4: ${{ vars.FORCE_IPV4 || 'false' }}
           ZOOMIT_REFRESH_TOKEN: ${{ secrets.ZOOMIT_REFRESH_TOKEN }}
           CODEBUDDY_REFRESH_TOKENS: ${{ secrets.CODEBUDDY_REFRESH_TOKENS }}
