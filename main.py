@@ -155,6 +155,7 @@ def default_ai_models(base_url):
 AI_MODELS = env_list("AI_MODELS", default_ai_models(AI_BASE_URL))
 AI_MAX_TOKENS = env_int("AI_MAX_TOKENS", 900)
 AI_ROUNDS = env_int("AI_ROUNDS", 2)
+AI_TIMEOUT_SEC = env_int("AI_TIMEOUT_SEC", 180)   # max wait for the first bytes of an AI reply
 AI_ROUND_BACKOFF_SEC = env_int("AI_ROUND_BACKOFF_SEC", 8)
 
 # --- Image generation (Pollinations) ---
@@ -891,7 +892,7 @@ def call_route(route, messages):
         "stream": True,
     }
     r = SESSION.post(url, data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-                     headers=headers, timeout=120, stream=True)
+                     headers=headers, timeout=AI_TIMEOUT_SEC, stream=True)
     try:
         if r.status_code != 200:
             raise HTTPFail(r.status_code, r.text)
