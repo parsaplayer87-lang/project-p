@@ -85,6 +85,11 @@ def env_json(name, default):
         return json.loads(default)
 
 
+# --- Network: some runners reach a host over IPv4 but hang on IPv6. FORCE_IPV4=true fixes that case. ---
+if env_bool("FORCE_IPV4", False):
+    import urllib3.util.connection as _urllib3_conn
+    _urllib3_conn.HAS_IPV6 = False
+
 # --- Site ---
 PLATFORM = env("PLATFORM", "zoomit").lower()               # zoomit | zoomg
 SITE_HOST = f"www.{PLATFORM}.ir"
@@ -97,7 +102,7 @@ DRY_RUN = env_bool("DRY_RUN", False)                        # True = log payload
 RUN_LIMIT_MINUTES = env_int("RUN_LIMIT_MINUTES", 345)       # stop before the 6h GitHub job limit
 CHECK_INTERVAL_SEC = env_int("CHECK_INTERVAL_SEC", 60)
 MAX_NOTIF_AGE_HOURS = env_int("MAX_NOTIF_AGE_HOURS", 12)    # never answer very old mentions
-MAX_ATTEMPTS_PER_NOTIF = env_int("MAX_ATTEMPTS_PER_NOTIF", 25)
+MAX_ATTEMPTS_PER_NOTIF = env_int("MAX_ATTEMPTS_PER_NOTIF", 120)   # ~2h of 60s cycles, so a long outage does not drop mentions
 AI_MIN_GAP_SEC = env_int("AI_MIN_GAP_SEC", 3)
 
 # --- Discussion limits ---
@@ -201,6 +206,10 @@ class AuthError(Exception):
     pass
 
 
+class NetworkError(Exception):
+    pass  # the server could not be reached at all (timeout, DNS, refused)
+
+
 # ════════════════════════════════════════════════════════════════════
 # STATE (encrypted file, restored and saved by GitHub Actions cache)
 # ════════════════════════════════════════════════════════════════════
@@ -291,6 +300,7 @@ def get_access_token(slot_name, token_url, client_id, seed_refresh, scope=None, 
         raise AuthError(f"{slot_name}: no refresh token configured")
 
     last_error = "unknown"
+    last_kind = "http"
     for refresh_token in candidates:
         form = {"grant_type": "refresh_token", "refresh_token": refresh_token, "client_id": client_id}
         if scope:
@@ -298,10 +308,12 @@ def get_access_token(slot_name, token_url, client_id, seed_refresh, scope=None, 
         try:
             r = SESSION.post(token_url, data=form, headers={"accept": "application/json"}, timeout=30)
         except requests.RequestException as e:
-            last_error = str(e)
+            last_error = type(e).__name__          # short name only: the message can contain the full URL
+            last_kind = "net"
             continue
         if r.status_code != 200:
             last_error = f"HTTP {r.status_code}"
+            last_kind = "http"
             continue
         body = r.json()
         lifetime = int(body.get("expires_in", 3600))
@@ -312,6 +324,8 @@ def get_access_token(slot_name, token_url, client_id, seed_refresh, scope=None, 
         STATE.save()
         log.info("%s token refreshed (lifetime %d min)", slot_name, lifetime // 60)
         return slot["access"]
+    if last_kind == "net":
+        raise NetworkError(f"{slot_name}: token server unreachable ({last_error})")
     raise AuthError(f"{slot_name}: refresh failed ({last_error})")
 
 
@@ -885,40 +899,65 @@ def is_good_output(text):
     return bool(text and text.strip()) and not CJK_RE.search(text)
 
 
+def route_blocked(route):
+    now = time.time()
+    locks = STATE.data["locks"]
+    if locks.get(route_key(route), 0) > now:
+        return True
+    if route["kind"] == "codebuddy":
+        return (locks.get("net:codebuddy", 0) > now
+                or locks.get(f"acct:codebuddy-{route['account']}", 0) > now)
+    return locks.get("net:generic", 0) > now
+
+
+def pause(name, seconds, reason):
+    STATE.data["locks"][name] = time.time() + seconds
+    STATE.dirty = True
+    log.warning("paused %s for %ds: %s", name, seconds, reason)
+
+
 def ask_ai(messages):
-    """Returns the raw AI text, or None. Never raises for normal AI failures."""
+    # Returns the raw AI text, or None. Normal AI failures never raise.
     routes = build_routes()
     if not routes:
         raise AuthError("no AI route configured (CODEBUDDY_REFRESH_TOKENS or AI_BASE_URL)")
     for round_no in range(max(1, AI_ROUNDS)):
         attempted = 0
         for route in routes:
-            key = route_key(route)
-            if STATE.data["locks"].get(key, 0) > time.time():
+            if route_blocked(route):
                 continue
             attempted += 1
+            key = route_key(route)
+            host_lock = "net:codebuddy" if route["kind"] == "codebuddy" else "net:generic"
             try:
                 text = call_route(route, messages)
                 if is_good_output(text):
                     log.info("AI answered via %s", key)
                     return text
-                lock_route(route, 20, "empty or non-Persian output")
+                pause(key, 20, "empty or non-Persian output")
+            except NetworkError as e:
+                pause(host_lock, 300, str(e))           # every route on this host is skipped for 5 min
+            except requests.RequestException as e:
+                pause(host_lock, 300, f"network {type(e).__name__}")
             except HTTPFail as e:
                 if route["kind"] == "codebuddy" and e.status in (401, 403):
                     slot = STATE.data["tokens"].get(f"codebuddy-{route['account']}")
                     if slot:
-                        slot["exp"] = 0          # force refresh on the next try
-                    lock_route(route, 900, f"auth HTTP {e.status}")
+                        slot["exp"] = 0                   # force a refresh next time
+                    pause(f"acct:codebuddy-{route['account']}", 900, f"auth HTTP {e.status}")
                 elif e.status == 429:
-                    lock_route(route, 1800, "rate or credit limit")
+                    pause(key, 1800, "rate or credit limit")
                 else:
-                    lock_route(route, 120, f"HTTP {e.status}")
+                    pause(key, 120, f"HTTP {e.status}")
             except AuthError as e:
-                lock_route(route, 900, str(e))
+                if route["kind"] == "codebuddy":
+                    pause(f"acct:codebuddy-{route['account']}", 900, str(e))
+                else:
+                    pause(key, 900, str(e))
             except Exception as e:
-                lock_route(route, 120, type(e).__name__)
+                pause(key, 120, type(e).__name__)
         if attempted == 0:
-            break                                # every route is paused right now
+            break
         time.sleep(AI_ROUND_BACKOFF_SEC * (round_no + 1))
     return None
 
@@ -1292,8 +1331,10 @@ def main():
     while time.time() < deadline - CHECK_INTERVAL_SEC:
         try:
             run_cycle()
-        except AuthError as e:
-            log.error("auth: %s", e)
+        except (AuthError, NetworkError) as e:
+            log.error("cycle: %s", e)
+        except requests.RequestException as e:
+            log.error("cycle: network error (%s), will retry", type(e).__name__)
         except Exception:
             log.exception("cycle crashed, continuing")
         STATE.save_if_dirty()
