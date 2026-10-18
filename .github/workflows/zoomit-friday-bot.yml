@@ -64,6 +64,23 @@ jobs:
           echo "secret CODEBUDDY_REFRESH_TOKENS set: $(yn "$S_CODEBUDDY")"
           echo "secret STATE_KEY set: $(yn "$S_STATE_KEY")"
 
+      - name: AI speed check (one tiny request, prints status and time)
+        continue-on-error: true
+        env:
+          AI_URL_X: ${{ vars.AI_BASE_URL || secrets.AI_BASE_URL }}
+          AI_KEY_X: ${{ secrets.AI_API_KEY }}
+          AI_MODEL_X: ${{ vars.AI_MODELS || secrets.AI_MODELS || 'deepseek-ai/deepseek-v4-flash' }}
+        run: |
+          if [ -z "$AI_URL_X" ] || [ -z "$AI_KEY_X" ]; then
+            echo "AI_BASE_URL or AI_API_KEY is missing, check skipped"
+            exit 0
+          fi
+          curl -sS -m 150 -o /tmp/ai.json -w "HTTP %{http_code} in %{time_total}s\n" \
+            "$AI_URL_X/chat/completions" \
+            -H "Authorization: Bearer $AI_KEY_X" -H "Content-Type: application/json" \
+            -d "{\"model\":\"$AI_MODEL_X\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with one word: OK\"}],\"max_tokens\":20}" || true
+          head -c 400 /tmp/ai.json 2>/dev/null; echo
+
       - name: Run bot
         env:
           PLATFORM: ${{ vars.PLATFORM || 'zoomit' }}
