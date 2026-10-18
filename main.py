@@ -143,7 +143,16 @@ CB_EXTRA_HEADERS = env_json(
 # --- Generic OpenAI-compatible endpoint (for example 9router at http://localhost:20128/v1) ---
 AI_BASE_URL = env("AI_BASE_URL").rstrip("/")
 AI_API_KEY = env("AI_API_KEY")
-AI_MODELS = env_list("AI_MODELS", "cbai/deepseek-v4.1-flash")
+def default_ai_models(base_url):
+    # Model id depends on the provider, so the default follows the base URL.
+    if "nvidia" in base_url:
+        return "deepseek-ai/deepseek-v4-flash"
+    if "openrouter" in base_url:
+        return "deepseek/deepseek-v4-flash:free"
+    return "cbai/deepseek-v4.1-flash"
+
+
+AI_MODELS = env_list("AI_MODELS", default_ai_models(AI_BASE_URL))
 AI_MAX_TOKENS = env_int("AI_MAX_TOKENS", 900)
 AI_ROUNDS = env_int("AI_ROUNDS", 2)
 AI_ROUND_BACKOFF_SEC = env_int("AI_ROUND_BACKOFF_SEC", 8)
@@ -946,7 +955,7 @@ def ask_ai(messages):
                         slot["exp"] = 0                   # force a refresh next time
                     pause(f"acct:codebuddy-{route['account']}", 900, f"auth HTTP {e.status}")
                 elif e.status == 429:
-                    pause(key, 1800, "rate or credit limit")
+                    pause(key, 180, "rate or credit limit")
                 else:
                     pause(key, 120, f"HTTP {e.status}")
             except AuthError as e:
@@ -957,6 +966,10 @@ def ask_ai(messages):
             except Exception as e:
                 pause(key, 120, type(e).__name__)
         if attempted == 0:
+            now = time.time()
+            paused = ", ".join(f"{name}={int(until - now)}s"
+                               for name, until in STATE.data["locks"].items() if until > now)
+            log.warning("no AI route is usable right now. paused: %s", paused or "none")
             break
         time.sleep(AI_ROUND_BACKOFF_SEC * (round_no + 1))
     return None
@@ -1320,6 +1333,9 @@ def main():
     STATE.load()
     log.info("F.R.I.D.A.Y. start | site=%s | api=%s | dry_run=%s | state_saved=%s | ai_routes=%d",
              SITE_NAME, API_BASE, DRY_RUN, bool(STATE.fernet), len(build_routes()))
+    log.info("AI config: base_url=%s api_key=%s codebuddy_accounts=%d models=%s",
+             urlparse(AI_BASE_URL).netloc or "NOT SET", "set" if AI_API_KEY else "NOT SET",
+             codebuddy_account_count(), ",".join(AI_MODELS) or "NOT SET")
     if not ZOOMIT_REFRESH_SEED and "zoomit" not in STATE.data["tokens"]:
         log.error("ZOOMIT_REFRESH_TOKEN is missing. Add it as a repository secret.")
         sys.exit(1)
