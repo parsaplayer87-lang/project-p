@@ -30,6 +30,15 @@ jobs:
       - name: Install dependencies
         run: pip install requests cryptography
 
+      - name: Network check (shows which APIs this runner can reach)
+        continue-on-error: true
+        run: |
+          for url in https://www.codebuddy.ai/ https://accounts.theforge.ir/ https://api2.zoomit.ir/ https://serpapi.com/ https://gen.pollinations.ai/ https://openrouter.ai/api/v1/models; do
+            v4=$(curl -4 -s -o /dev/null -w "%{http_code}" --connect-timeout 10 --max-time 20 "$url" || true)
+            any=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 10 --max-time 20 "$url" || true)
+            echo "IPv4=$v4  default=$any  $url"
+          done
+
       - name: Restore bot state (encrypted)
         uses: actions/cache/restore@v4
         with:
@@ -43,10 +52,12 @@ jobs:
           PLATFORM: ${{ vars.PLATFORM || 'zoomit' }}
           DRY_RUN: ${{ vars.DRY_RUN || 'false' }}
           RUN_LIMIT_MINUTES: ${{ vars.RUN_LIMIT_MINUTES || '345' }}
-          IMAGE_MODEL: ${{ vars.IMAGE_MODEL || 'black-forest-labs/flux.1-schnell' }}
+          IMAGE_MODEL: ${{ vars.IMAGE_MODEL || 'flux' }}
           CODEBUDDY_CHAT_URL: ${{ vars.CODEBUDDY_CHAT_URL }}
           CODEBUDDY_EXTRA_HEADERS: ${{ vars.CODEBUDDY_EXTRA_HEADERS }}
           AI_BASE_URL: ${{ vars.AI_BASE_URL }}
+          AI_MODELS: ${{ vars.AI_MODELS }}
+          FORCE_IPV4: ${{ vars.FORCE_IPV4 || 'false' }}
           ZOOMIT_REFRESH_TOKEN: ${{ secrets.ZOOMIT_REFRESH_TOKEN }}
           CODEBUDDY_REFRESH_TOKENS: ${{ secrets.CODEBUDDY_REFRESH_TOKENS }}
           STATE_KEY: ${{ secrets.STATE_KEY }}
