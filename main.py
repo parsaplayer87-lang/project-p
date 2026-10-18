@@ -156,8 +156,8 @@ TEAM_INFO = env("ZOOMIT_TEAM_INFO")
 MEMORY_MESSAGES = max(1, env_int("MEMORY_MESSAGES", 10))
 
 # --- Web search and news ---
-SEARCH_PROVIDER = env("SEARCH_PROVIDER", "brave").lower()   # brave | groq | off
-BRAVE_API_KEY = env("BRAVE_API_KEY")
+SEARCH_PROVIDER = env("SEARCH_PROVIDER", "serpapi").lower()   # serpapi | groq | off
+SERPAPI_KEY = env("SERPAPI_API_KEY")
 GROQ_API_KEY = env("GROQ_API_KEY")
 GROQ_SEARCH_MODEL = env("GROQ_SEARCH_MODEL", "groq/compound")
 SEARCH_MAX_RESULTS = env_int("SEARCH_MAX_RESULTS", 5)
@@ -176,11 +176,15 @@ ID_RE = re.compile(r"[0-9a-fA-F]{24}")
 PREFERRED_ID_KEYS = ("avatarUploadKey", "uploadKey", "stickerId", "mediaId", "key", "id")
 # Same order as content.js: anonymous first (matches the site), then authenticated fallbacks.
 UPLOAD_CANDIDATES = [
+    # Same order as content.js: anonymous first (site behaviour), then authenticated fallbacks.
     {"url": f"{API_BASE}/media/profile", "auth": False},
     {"url": f"{API_BASE}/media", "auth": False},
     {"url": f"{API_BASE}/media/upload", "auth": False},
+    {"url": f"{API_BASE}/api/media", "auth": False},
+    {"url": f"{API_BASE}/api/upload", "auth": False},
     {"url": f"{API_BASE}/media/profile", "auth": True},
     {"url": f"{API_BASE}/media", "auth": True},
+    {"url": f"{API_BASE}/media/upload", "auth": True},
 ]
 
 SESSION = requests.Session()
@@ -527,7 +531,7 @@ def format_memory(user_id):
 
 
 # ════════════════════════════════════════════════════════════════════
-# WEB SEARCH AND NEWS (Brave by default, Groq optional, cached)
+# WEB SEARCH AND NEWS (SerpApi by default, Groq optional, cached)
 # ════════════════════════════════════════════════════════════════════
 GREETING_RE = re.compile(r"^\s*(سلام|درود|چطوری|خوبی|چه خبر|چه خبرا|صبح بخیر|عصر بخیر|شب بخیر)[\s!؟?.،]*$")
 NEWS_PHRASES = ("اخبار", "خبر جدید", "خبرهای", "آخرین خبر", "چه خبر جدید", "امروز", "الان", "تازه",
@@ -551,22 +555,36 @@ def strip_tags(text):
     return re.sub(r"<[^>]+>", "", text or "").strip()
 
 
-def brave_search(query, news):
-    # Endpoints and X-Subscription-Token header from the Brave Search API docs.
-    if not BRAVE_API_KEY:
-        raise AuthError("BRAVE_API_KEY is missing")
-    url = "https://api.search.brave.com/res/v1/news/search" if news else "https://api.search.brave.com/res/v1/web/search"
-    params = {"q": query, "count": SEARCH_MAX_RESULTS}
-    if news:
-        params["freshness"] = "pw"
-    r = SESSION.get(url, params=params,
-                    headers={"accept": "application/json", "X-Subscription-Token": BRAVE_API_KEY}, timeout=20)
+def serpapi_search(query, news):
+    # SerpApi: GET https://serpapi.com/search with engine, q and api_key as a query parameter.
+    # organic_results for Google web search, news_results for engine=google_news.
+    if not SERPAPI_KEY:
+        raise AuthError("SERPAPI_API_KEY is missing")
+    params = {"engine": "google_news" if news else "google", "q": query, "api_key": SERPAPI_KEY}
+    try:
+        r = SESSION.get("https://serpapi.com/search", params=params,
+                        headers={"accept": "application/json"}, timeout=30)
+    except requests.RequestException as e:
+        # Do not pass on the exception text: it can contain the URL, and the URL contains the key.
+        raise RuntimeError(f"SerpApi network error: {type(e).__name__}") from None
     if r.status_code != 200:
         raise HTTPFail(r.status_code, r.text)
     data = r.json() or {}
-    items = data.get("results") if news else (data.get("web") or {}).get("results")
-    return [{"title": strip_tags(i.get("title")), "url": i.get("url", ""),
-             "description": strip_tags(i.get("description"))} for i in (items or [])[:SEARCH_MAX_RESULTS]]
+    if data.get("error"):
+        raise RuntimeError(f"SerpApi error: {str(data['error'])[:200]}")
+    raw = data.get("news_results") if news else data.get("organic_results")
+    items = []
+    for i in (raw or [])[:SEARCH_MAX_RESULTS]:
+        desc = i.get("snippet") or ""
+        if news:
+            source = i.get("source")
+            if isinstance(source, dict):
+                source = source.get("name")
+            meta = " ".join(x for x in [source, i.get("date")] if x)
+            desc = f"{meta}: {desc}" if meta else desc
+        items.append({"title": strip_tags(i.get("title")), "url": i.get("link", ""),
+                      "description": strip_tags(desc)})
+    return items
 
 
 def groq_search(query):
@@ -608,7 +626,7 @@ def web_search(query, mode):
     if hit and time.time() - hit["t"] < SEARCH_CACHE_MINUTES * 60:
         return hit["text"]
     try:
-        items = groq_search(query) if SEARCH_PROVIDER == "groq" else brave_search(query, mode == "news")
+        items = groq_search(query) if SEARCH_PROVIDER == "groq" else serpapi_search(query, mode == "news")
     except Exception as e:
         log.warning("web search failed (%s): %s", SEARCH_PROVIDER, e)
         return ""
@@ -748,13 +766,13 @@ CONVERSATION
 - Special users: ParsaNa8 is the best Zoomit user. آقا غلام is a much-loved member of the community. Be warm with both.
 
 IMAGES
-- Only when the user explicitly asks you to draw, create or generate a picture: write your normal reply first, then add one final line exactly in this form: [IMAGE: short English description of the picture]
-- Never add this line in any other case.
+- Pictures are created by a separate system, never by you. Never write image tags, prompts or placeholders.
+- The context has a "Picture status" line when a picture was requested. If it says a picture is attached, say so briefly in Persian. If it says the picture could not be created, say so honestly and suggest trying again. Never claim a picture is attached unless the status says so.
 {TEAM_BLOCK}
 """
 
 
-def build_messages(*, tagger_name, tagged_text, thread_text, title, slug, bio, memory, search_text=""):
+def build_messages(*, tagger_name, tagged_text, thread_text, title, slug, bio, memory, search_text="", image_note=""):
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     system = SYSTEM_PROMPT.replace("{SITE_NAME}", SITE_NAME)
     system = system.replace("{TEAM_BLOCK}", f"\nReference team information (use only when asked):\n{TEAM_INFO}\n" if TEAM_INFO else "")
@@ -768,6 +786,8 @@ def build_messages(*, tagger_name, tagged_text, thread_text, title, slug, bio, m
     parts.append(f"Message to answer (from {tagger_name}):\n{tagged_text or '[only a mention, no text]'}")
     if search_text:
         parts.append("Web search results (current; base facts on these and name the source site):\n" + search_text)
+    if image_note:
+        parts.append("Picture status: " + image_note)
     if bio:
         parts.append(f"User bio (self-written, optional): {bio[:300]}")
     if memory:
@@ -1016,6 +1036,39 @@ def upload_sticker(image_bytes):
     return None
 
 
+# ════════════════════════════════════════════════════════════════════
+# PICTURE REQUESTS (decided in code, not by the model)
+# ════════════════════════════════════════════════════════════════════
+IMAGE_PROMPT_SYSTEM = ("Turn the user's request into ONE short English prompt for an image generator. "
+                       "Describe the subject, style and mood. Output only the prompt: no quotes, no labels, no explanation.")
+IMAGE_NOUNS = ("عکس", "تصویر", "نقاشی", "پوستر", "لوگو", "آواتار", "کاریکاتور", "والپیپر",
+               "image", "picture", "photo", "pic", "logo", "poster", "drawing", "avatar", "wallpaper")
+IMAGE_VERBS = ("بکش", "بساز", "درست کن", "تولید کن", "نقاشی کن", "draw", "create", "generate", "make", "design")
+HOW_TO_RE = re.compile(r"^\s*(چطور|چطوری|چگونه|how)\b", re.IGNORECASE)
+
+
+def wants_image(text):
+    # True when the user asks us to MAKE a picture (also when phrased as a question: "میشه ... بکشی؟").
+    # False for questions about pictures ("چطور عکس بکشم؟", "عکس این گوشی چطوره؟").
+    low = (text or "").lower()
+    if not any(noun in low for noun in IMAGE_NOUNS):
+        return False
+    if not any(verb in low for verb in IMAGE_VERBS):
+        return False
+    return not HOW_TO_RE.match(low)
+
+
+def image_prompt_for(user_text):
+    raw = ask_ai([
+        {"role": "system", "content": IMAGE_PROMPT_SYSTEM},
+        {"role": "user", "content": (user_text or "")[:500]},
+    ])
+    if not raw:
+        return None
+    prompt = " ".join(raw.replace('"', "").replace("'", "").split())[:300]
+    return prompt or None
+
+
 def make_image_sticker(prompt):
     try:
         image = generate_image(prompt)
@@ -1027,7 +1080,7 @@ def make_image_sticker(prompt):
         return None
     media_id = upload_sticker(image)
     if media_id:
-        log.info("sticker ready: %s", media_id)
+        log.info("sticker ready: %s (preview %s/media/%s?w=128&q=75)", media_id, API_BASE, media_id)
     return media_id
 
 
@@ -1128,6 +1181,22 @@ def handle_mention(n):
     search_mode = needs_search(tagged_text)
     search_text = web_search(tagged_text[:200], search_mode) if search_mode else ""
 
+    sticker_ids = []
+    image_note = ""
+    if wants_image(tagged_text):
+        final_try = STATE.data["attempts"].get(nid, 0) >= MAX_ATTEMPTS_PER_NOTIF - 2
+        prompt = image_prompt_for(tagged_text)
+        sid = make_image_sticker(prompt) if prompt else None
+        if sid:
+            sticker_ids.append(sid)
+            image_note = "A picture was created and is attached to your reply."
+        elif not final_try:
+            log.info("picture for mention %s not ready yet, will retry", nid)
+            return "retry"
+        else:
+            image_note = ("A picture was requested but could not be created this time. "
+                          "Say so honestly and do not claim that a picture is attached.")
+
     messages = build_messages(
         tagger_name=tagger_name,
         tagged_text=tagged_text,
@@ -1137,6 +1206,7 @@ def handle_mention(n):
         bio=fetch_user_bio(tagger_id),
         memory=format_memory(tagger_id),
         search_text=search_text,
+        image_note=image_note,
     )
 
     raw = ask_ai(messages)
@@ -1144,13 +1214,7 @@ def handle_mention(n):
         log.info("AI unavailable for mention %s, will retry later", nid)
         return "retry"
 
-    body_text, image_prompt = split_image_marker(raw)
-    text = sanitize_reply(body_text)
-    sticker_ids = []
-    if image_prompt:
-        sid = make_image_sticker(image_prompt)
-        if sid:
-            sticker_ids.append(sid)
+    text = sanitize_reply(IMAGE_MARK_RE.sub("", raw))   # strip any stray tag; pictures no longer come from tags
     if not text and not sticker_ids:
         return "retry"
 
