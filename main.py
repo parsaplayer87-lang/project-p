@@ -426,16 +426,33 @@ def zoomit_request(method, url, params=None, body=None, retry_auth=True):
     return r
 
 
-def fetch_mentions():
-    r = zoomit_request(
-        "GET",
-        f"{API_BASE}/notifier/api/notifications",
-        params={"PageNumber": 1, "PageSize": 50, "isRead": "false"},
-    )
-    if r.status_code != 200:
-        raise HTTPFail(r.status_code, r.text)
-    items = (r.json() or {}).get("source") or []
-    return [n for n in items if str(n.get("type", "")).lower() == "mention"]
+NOTIF_PAGE_SIZE = 50
+NOTIF_MAX_PAGES = env_int("NOTIF_MAX_PAGES", 5)     # enough pages that unread non-mentions cannot hide new mentions
+
+
+def is_mention(n):
+    return str(n.get("type", "")).strip().lower() == "mention"
+
+
+def fetch_unread():
+    # All unread notifications (every type), across pages. Only mentions get a reply; the rest are marked read.
+    items, seen = [], set()
+    for page in range(1, NOTIF_MAX_PAGES + 1):
+        r = zoomit_request("GET", f"{API_BASE}/notifier/api/notifications",
+                           params={"PageNumber": page, "PageSize": NOTIF_PAGE_SIZE, "isRead": "false"})
+        if r.status_code != 200:
+            raise HTTPFail(r.status_code, r.text)
+        data = r.json() or {}
+        page_items = data.get("source") or []
+        for n in page_items:
+            if n.get("id") and n["id"] not in seen:
+                seen.add(n["id"])
+                items.append(n)
+        done = set(STATE.data["processed"])
+        # go on to the next page only when this whole page is already handled (new items may be further down)
+        if not data.get("hasNext") or any(n.get("id") not in done for n in page_items):
+            break
+    return items
 
 
 def parse_mention_link(url):
@@ -1357,15 +1374,32 @@ def handle_mention(n):
     return "done"
 
 
+def mark_safely(nid):
+    try:
+        mark_notification_read(nid)
+    except Exception as e:
+        log.warning("mark-as-read error on %s: %s", nid, e)
+
+
 def run_cycle():
     zoomit_token()                                 # keeps the token alive and identifies the bot
-    mentions = fetch_mentions()
+    notifications = fetch_unread()
     done = set(STATE.data["processed"])
-    fresh = [n for n in mentions if n.get("id") and n["id"] not in done]
+    fresh = [n for n in notifications if n.get("id") and n["id"] not in done]
     if not fresh:
         return
-    log.info("%d new mention(s)", len(fresh))
-    for n in fresh:
+    mentions = [n for n in fresh if is_mention(n)]
+    others = [n for n in fresh if not is_mention(n)]
+    if others:
+        log.info("%d non-mention notification(s): marked read, no reply", len(others))
+    for n in others:
+        STATE.mark_processed(n["id"])
+        mark_safely(n["id"])
+    STATE.save_if_dirty()
+    if not mentions:
+        return
+    log.info("%d new mention(s)", len(mentions))
+    for n in mentions:
         nid = n["id"]
         try:
             outcome = handle_mention(n)
@@ -1378,10 +1412,7 @@ def run_cycle():
 
         if outcome == "done":
             STATE.mark_processed(nid)
-            try:
-                mark_notification_read(nid)
-            except Exception as e:
-                log.warning("mark-as-read error on %s: %s", nid, e)
+            mark_safely(nid)
         else:
             attempts = STATE.data["attempts"].get(nid, 0) + 1
             STATE.data["attempts"][nid] = attempts
@@ -1389,6 +1420,7 @@ def run_cycle():
             if attempts >= MAX_ATTEMPTS_PER_NOTIF:
                 log.warning("giving up on mention %s after %d attempts (nothing posted)", nid, attempts)
                 STATE.mark_processed(nid)
+                mark_safely(nid)
         STATE.save_if_dirty()
         time.sleep(AI_MIN_GAP_SEC)
 
