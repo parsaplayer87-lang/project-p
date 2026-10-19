@@ -430,8 +430,14 @@ NOTIF_PAGE_SIZE = 50
 NOTIF_MAX_PAGES = env_int("NOTIF_MAX_PAGES", 5)     # enough pages that unread non-mentions cannot hide new mentions
 
 
+MENTION_TEXT = "مورد خطاب قرار گرفته"   # "you were addressed in ..." - the mention sentence in Zoomit notifications
+
+
 def is_mention(n):
-    return str(n.get("type", "")).strip().lower() == "mention"
+    kind = str(n.get("type", "")).strip().lower()
+    if "mention" in kind:                             # Mention, QuestionMention, AnswerMention, ...
+        return True
+    return MENTION_TEXT in str(n.get("text", ""))     # the type can differ; the sentence does not
 
 
 def fetch_unread():
@@ -1386,6 +1392,8 @@ def run_cycle():
     notifications = fetch_unread()
     done = set(STATE.data["processed"])
     fresh = [n for n in notifications if n.get("id") and n["id"] not in done]
+    log.info("poll: %d unread, %d new, types=%s", len(notifications), len(fresh),
+             sorted({str(n.get("type")) for n in notifications}))
     if not fresh:
         return
     mentions = [n for n in fresh if is_mention(n)]
@@ -1393,6 +1401,8 @@ def run_cycle():
     if others:
         log.info("%d non-mention notification(s): marked read, no reply", len(others))
     for n in others:
+        log.info("  marked read (no reply): type=%s text=%s", n.get("type"),
+                 str(n.get("text", ""))[:90].replace("\n", " "))
         STATE.mark_processed(n["id"])
         mark_safely(n["id"])
     STATE.save_if_dirty()
