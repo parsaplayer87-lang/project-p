@@ -153,6 +153,54 @@ def default_ai_models(base_url):
 
 
 AI_MODELS = env_list("AI_MODELS", default_ai_models(AI_BASE_URL))
+AI_PROVIDERS_RAW = env("AI_PROVIDERS")                      # JSON list, stored as a SECRET
+AI_TOTAL_BUDGET_SEC = env_int("AI_TOTAL_BUDGET_SEC", 420)   # max time for one reply across all providers
+
+
+def load_providers():
+    # Each entry: {"name", "base_url", "api_key" (optional), "models": [...] or "m1, m2", "headers": {} (optional)}
+    # Tried in the order listed. Every provider must be OpenAI-compatible (POST {base_url}/chat/completions).
+    items = []
+    if AI_PROVIDERS_RAW:
+        try:
+            parsed = json.loads(AI_PROVIDERS_RAW)
+        except ValueError:
+            log.error("AI_PROVIDERS is not valid JSON, ignored")
+            parsed = []
+        if isinstance(parsed, dict):
+            parsed = [parsed]
+        if isinstance(parsed, list):
+            items.extend(parsed)
+    if AI_BASE_URL:
+        items.append({"name": "legacy", "base_url": AI_BASE_URL, "api_key": AI_API_KEY, "models": AI_MODELS})
+    providers, seen = [], set()
+    for i, raw in enumerate(items, 1):
+        if not isinstance(raw, dict):
+            log.warning("AI provider #%d is not an object, skipped", i)
+            continue
+        base = str(raw.get("base_url", "")).strip().rstrip("/")
+        models = raw.get("models") or []
+        if isinstance(models, str):
+            models = [x.strip() for x in models.split(",") if x.strip()]
+        if not base.startswith("http") or not models:
+            log.warning("AI provider #%d needs base_url (starting with http) and models, skipped", i)
+            continue
+        name = re.sub(r"[^a-zA-Z0-9_-]", "", str(raw.get("name") or f"provider{i}"))[:30] or f"provider{i}"
+        base_name, n = name, 2
+        while name in seen:
+            name, n = f"{base_name}{n}", n + 1
+        seen.add(name)
+        providers.append({
+            "name": name,
+            "base_url": base,
+            "api_key": str(raw.get("api_key") or "").strip(),
+            "models": [str(x).strip() for x in models if str(x).strip()],
+            "headers": dict(raw.get("headers") or {}),
+        })
+    return providers
+
+
+PROVIDERS = load_providers()
 AI_MAX_TOKENS = env_int("AI_MAX_TOKENS", 900)
 AI_ROUNDS = env_int("AI_ROUNDS", 2)
 AI_TIMEOUT_SEC = env_int("AI_TIMEOUT_SEC", 180)   # max wait for the first bytes of an AI reply
@@ -831,14 +879,14 @@ def codebuddy_account_count():
 
 
 def build_routes():
-    """Every model is tried on every account before moving to the next model."""
+    # Order: CodeBuddy first (main model), then each provider in list order. Each model is tried in turn.
     routes = []
     for model in CB_MODELS:
         for account in range(codebuddy_account_count()):
             routes.append({"kind": "codebuddy", "account": account, "model": model})
-    if AI_BASE_URL:
-        for model in AI_MODELS:
-            routes.append({"kind": "generic", "account": None, "model": model})
+    for provider in PROVIDERS:
+        for model in provider["models"]:
+            routes.append({"kind": "generic", "account": provider["name"], "model": model, "provider": provider})
     return routes
 
 
@@ -880,8 +928,11 @@ def call_route(route, messages):
         headers = dict(CB_EXTRA_HEADERS)
         headers["authorization"] = f"Bearer {token}"
     else:
-        url = f"{AI_BASE_URL}/chat/completions"
-        headers = {"authorization": f"Bearer {AI_API_KEY}"} if AI_API_KEY else {}
+        provider = route["provider"]
+        url = f"{provider['base_url']}/chat/completions"
+        headers = dict(provider.get("headers") or {})
+        if provider.get("api_key"):
+            headers["authorization"] = f"Bearer {provider['api_key']}"
     headers["content-type"] = "application/json"
     body = {
         "model": route["model"],
@@ -917,7 +968,14 @@ def route_blocked(route):
     if route["kind"] == "codebuddy":
         return (locks.get("net:codebuddy", 0) > now
                 or locks.get(f"acct:codebuddy-{route['account']}", 0) > now)
-    return locks.get("net:generic", 0) > now
+    name = route["account"]
+    return locks.get(f"net:prov:{name}", 0) > now or locks.get(f"auth:prov:{name}", 0) > now
+
+
+def host_lock_name(route):
+    if route["kind"] == "codebuddy":
+        return "net:codebuddy"
+    return f"net:prov:{route['account']}"
 
 
 def pause(name, seconds, reason):
@@ -930,15 +988,18 @@ def ask_ai(messages):
     # Returns the raw AI text, or None. Normal AI failures never raise.
     routes = build_routes()
     if not routes:
-        raise AuthError("no AI route configured (CODEBUDDY_REFRESH_TOKENS or AI_BASE_URL)")
+        raise AuthError("no AI route configured (CODEBUDDY_REFRESH_TOKENS or AI_PROVIDERS)")
+    started = time.time()
     for round_no in range(max(1, AI_ROUNDS)):
         attempted = 0
         for route in routes:
             if route_blocked(route):
                 continue
+            if attempted and time.time() - started >= AI_TOTAL_BUDGET_SEC:
+                log.warning("AI time budget (%ds) used up, will try again later", AI_TOTAL_BUDGET_SEC)
+                return None
             attempted += 1
             key = route_key(route)
-            host_lock = "net:codebuddy" if route["kind"] == "codebuddy" else "net:generic"
             try:
                 text = call_route(route, messages)
                 if is_good_output(text):
@@ -946,19 +1007,24 @@ def ask_ai(messages):
                     return text
                 pause(key, 20, "empty or non-Persian output")
             except NetworkError as e:
-                pause(host_lock, 300, str(e))           # every route on this host is skipped for 5 min
+                pause(host_lock_name(route), 300, str(e))
             except requests.RequestException as e:
-                pause(host_lock, 300, f"network {type(e).__name__}")
+                pause(host_lock_name(route), 300, f"network {type(e).__name__}")
             except HTTPFail as e:
                 if route["kind"] == "codebuddy" and e.status in (401, 403):
                     slot = STATE.data["tokens"].get(f"codebuddy-{route['account']}")
                     if slot:
                         slot["exp"] = 0                   # force a refresh next time
                     pause(f"acct:codebuddy-{route['account']}", 900, f"auth HTTP {e.status}")
+                elif route["kind"] == "generic" and e.status in (401, 403):
+                    # the key is wrong for this provider: skip all its models for 1 hour (the key is never logged)
+                    pause(f"auth:prov:{route['account']}", 3600, f"{route['account']} rejected the key (HTTP {e.status})")
                 elif e.status == 429:
                     pause(key, 180, "rate or credit limit")
+                elif e.status == 404:
+                    pause(key, 1800, str(e))              # model not found on this provider
                 else:
-                    pause(key, 120, str(e))           # includes the provider's error text, e.g. "model not found"
+                    pause(key, 120, str(e))
             except AuthError as e:
                 if route["kind"] == "codebuddy":
                     pause(f"acct:codebuddy-{route['account']}", 900, str(e))
@@ -1334,14 +1400,15 @@ def main():
     STATE.load()
     log.info("F.R.I.D.A.Y. start | site=%s | api=%s | dry_run=%s | state_saved=%s | ai_routes=%d",
              SITE_NAME, API_BASE, DRY_RUN, bool(STATE.fernet), len(build_routes()))
-    log.info("AI config: base_url=%s api_key=%s codebuddy_accounts=%d models=%s",
-             urlparse(AI_BASE_URL).netloc or "NOT SET", "set" if AI_API_KEY else "NOT SET",
-             codebuddy_account_count(), ",".join(AI_MODELS) or "NOT SET")
+    log.info("AI providers (in order): %s | codebuddy_accounts=%d",
+             ", ".join(f"{p['name']}({urlparse(p['base_url']).netloc}, {len(p['models'])} model(s), "
+                       f"key {'set' if p['api_key'] else 'none'})" for p in PROVIDERS) or "NONE",
+             codebuddy_account_count())
     if not ZOOMIT_REFRESH_SEED and "zoomit" not in STATE.data["tokens"]:
         log.error("ZOOMIT_REFRESH_TOKEN is missing. Add it as a repository secret.")
         sys.exit(1)
     if not build_routes():
-        log.error("No AI route. Set CODEBUDDY_REFRESH_TOKENS and/or AI_BASE_URL.")
+        log.error("No AI route. Set CODEBUDDY_REFRESH_TOKENS and/or AI_PROVIDERS.")
         sys.exit(1)
 
     deadline = time.time() + RUN_LIMIT_MINUTES * 60
