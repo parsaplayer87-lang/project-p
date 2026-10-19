@@ -55,6 +55,7 @@ jobs:
           S_ZOOMIT: ${{ secrets.ZOOMIT_REFRESH_TOKEN }}
           S_CODEBUDDY: ${{ secrets.CODEBUDDY_REFRESH_TOKENS }}
           S_STATE_KEY: ${{ secrets.STATE_KEY }}
+          S_AI_PROVIDERS: ${{ secrets.AI_PROVIDERS }}
         run: |
           yn() { if [ -n "$1" ]; then echo yes; else echo no; fi; }
           echo "variable AI_BASE_URL set: $(yn "$V_AI_BASE_URL")"
@@ -63,6 +64,7 @@ jobs:
           echo "secret ZOOMIT_REFRESH_TOKEN set: $(yn "$S_ZOOMIT")"
           echo "secret CODEBUDDY_REFRESH_TOKENS set: $(yn "$S_CODEBUDDY")"
           echo "secret STATE_KEY set: $(yn "$S_STATE_KEY")"
+          echo "secret AI_PROVIDERS set: $(yn "$S_AI_PROVIDERS")"
 
       - name: AI speed check (one tiny request, prints status and time)
         continue-on-error: true
@@ -91,6 +93,8 @@ jobs:
           CODEBUDDY_EXTRA_HEADERS: ${{ vars.CODEBUDDY_EXTRA_HEADERS }}
           AI_BASE_URL: ${{ vars.AI_BASE_URL || secrets.AI_BASE_URL }}
           AI_MODELS: ${{ vars.AI_MODELS || secrets.AI_MODELS }}
+          AI_PROVIDERS: ${{ secrets.AI_PROVIDERS }}
+          AI_TOTAL_BUDGET_SEC: ${{ vars.AI_TOTAL_BUDGET_SEC }}
           FORCE_IPV4: ${{ vars.FORCE_IPV4 || 'false' }}
           ZOOMIT_REFRESH_TOKEN: ${{ secrets.ZOOMIT_REFRESH_TOKEN }}
           CODEBUDDY_REFRESH_TOKENS: ${{ secrets.CODEBUDDY_REFRESH_TOKENS }}
