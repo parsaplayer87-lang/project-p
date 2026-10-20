@@ -229,6 +229,7 @@ SEARCH_CACHE_MINUTES = env_int("SEARCH_CACHE_MINUTES", 30)
 # --- Mark as read. Set NOTIF_READ_TEMPLATE to pin the endpoint, e.g. "PUT /notifier/api/notifications/{id}/read"
 NOTIF_READ_TEMPLATE = env("NOTIF_READ_TEMPLATE")
 NOTIF_READ_AUTODISCOVER = env_bool("NOTIF_READ_AUTODISCOVER", True)
+RESET_PROCESSED = env_bool("RESET_PROCESSED", False)   # one-off: forget handled ids so they are checked again
 
 # --- Runtime globals ---
 BOT_NAME = ""
@@ -282,6 +283,7 @@ class State:
         "upload_index": 0,   # working upload candidate
         "search_cache": {},  # query key -> {t, text}
         "read_strategy": None,  # index into READ_CANDIDATES once found, -1 when none works
+        "read_tries": {},       # notification id -> mark-as-read retries after handling
     }
 
     def __init__(self):
@@ -1306,6 +1308,7 @@ def handle_mention(n):
     tagger_id = author.get("userId") or ""
     tagger_name = author.get("userName") or author.get("fullName") or "کاربر"
     if BOT_USER_ID and tagger_id == BOT_USER_ID:
+        log.info("mention %s is from the bot's own account, skipped", nid)
         return "done"                             # never answer ourselves
 
     root_id = root_of(index, mention["id"])
@@ -1382,9 +1385,13 @@ def handle_mention(n):
 
 def mark_safely(nid):
     try:
-        mark_notification_read(nid)
+        ok = mark_notification_read(nid)
     except Exception as e:
         log.warning("mark-as-read error on %s: %s", nid, e)
+        return False
+    if ok:
+        log.info("marked read: %s", nid)
+    return ok
 
 
 def run_cycle():
@@ -1394,7 +1401,20 @@ def run_cycle():
     fresh = [n for n in notifications if n.get("id") and n["id"] not in done]
     log.info("poll: %d unread, %d new, types=%s", len(notifications), len(fresh),
              sorted({str(n.get("type")) for n in notifications}))
+    # handled earlier but still unread on the server: try to mark them read again (3 tries each, logged)
+    stale = [n for n in notifications if n.get("id") in done]
+    for n in stale[:5]:
+        nid = n["id"]
+        tries = STATE.data["read_tries"].get(nid, 0)
+        if tries >= 3:
+            continue
+        STATE.data["read_tries"][nid] = tries + 1
+        STATE.dirty = True
+        log.info("retry mark-as-read for handled notification %s (try %d)", nid, tries + 1)
+        if mark_safely(nid):
+            STATE.data["read_tries"].pop(nid, None)
     if not fresh:
+        STATE.save_if_dirty()
         return
     mentions = [n for n in fresh if is_mention(n)]
     others = [n for n in fresh if not is_mention(n)]
@@ -1438,8 +1458,21 @@ def run_cycle():
 # ════════════════════════════════════════════════════════════════════
 # MAIN LOOP (time-boxed; the workflow starts the next run at the end)
 # ════════════════════════════════════════════════════════════════════
+def apply_reset_if_requested():
+    # RESET_PROCESSED=true: forget handled ids and retry counts once. Tokens, memory and locks are kept.
+    if not RESET_PROCESSED:
+        return False
+    STATE.data["processed"] = []
+    STATE.data["attempts"] = {}
+    STATE.data["read_tries"] = {}
+    STATE.dirty = True
+    log.warning("RESET_PROCESSED=true: handled list cleared. Set it back to false after this run.")
+    return True
+
+
 def main():
     STATE.load()
+    apply_reset_if_requested()
     log.info("F.R.I.D.A.Y. start | site=%s | api=%s | dry_run=%s | state_saved=%s | ai_routes=%d",
              SITE_NAME, API_BASE, DRY_RUN, bool(STATE.fernet), len(build_routes()))
     log.info("AI providers (in order): %s | codebuddy_accounts=%d",
