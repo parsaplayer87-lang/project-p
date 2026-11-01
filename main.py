@@ -223,7 +223,7 @@ AI_ROUND_BACKOFF_SEC = env_int("AI_ROUND_BACKOFF_SEC", 8)
 
 # --- Image generation (Pollinations) ---
 POLLINATIONS_KEY = env("POLLINATIONS_API_KEY")
-IMAGE_MODEL = env("IMAGE_MODEL", "flux")
+IMAGE_MODEL = env("IMAGE_MODEL", "black-forest-labs/flux.1-schnell")
 IMAGE_SIZE = env_int("IMAGE_SIZE", 768)
 IMAGE_MAX_BYTES = 2 * 1024 * 1024                           # Zoomit upload limit
 

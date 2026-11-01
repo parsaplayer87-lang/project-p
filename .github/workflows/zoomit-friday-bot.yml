@@ -103,7 +103,7 @@ jobs:
           CB_URL: ${{ vars.CODEBUDDY_CHAT_URL || 'https://www.codebuddy.ai/v2/chat/completions' }}
           CB_REFRESH_URL: ${{ vars.CODEBUDDY_TOKEN_URL || 'https://www.codebuddy.ai/v2/plugin/auth/token/refresh' }}
           POLL_KEY: ${{ secrets.POLLINATIONS_API_KEY }}
-          POLL_MODEL: ${{ vars.IMAGE_MODEL || 'flux' }}
+          POLL_MODEL: ${{ vars.IMAGE_MODEL || 'black-forest-labs/flux.1-schnell' }}
         run: |
           body='[{"role":"system","content":"You are helpful."},{"role":"user","content":"Reply with one word: OK"}]'
           tok=$(printf '%s' "$KC_TOKENS" | cut -d, -f1)
@@ -155,7 +155,7 @@ jobs:
           PLATFORM: ${{ vars.PLATFORM || 'zoomit' }}
           DRY_RUN: ${{ vars.DRY_RUN || 'false' }}
           RUN_LIMIT_MINUTES: ${{ vars.RUN_LIMIT_MINUTES || '345' }}
-          IMAGE_MODEL: ${{ vars.IMAGE_MODEL || 'flux' }}
+          IMAGE_MODEL: ${{ vars.IMAGE_MODEL || 'black-forest-labs/flux.1-schnell' }}
           RESET_PROCESSED: ${{ vars.RESET_PROCESSED || 'false' }}
           CODEBUDDY_CHAT_URL: ${{ vars.CODEBUDDY_CHAT_URL }}
           CODEBUDDY_EXTRA_HEADERS: ${{ vars.CODEBUDDY_EXTRA_HEADERS }}
