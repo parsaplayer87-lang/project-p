@@ -1039,7 +1039,8 @@ CONVERSATION
 - Answer that message directly. Use the rest of the discussion only when it helps.
 - To tag a user from the discussion, write @UserName exactly as it appears there. Only tag users who really appear in the discussion, and only when it helps them.
 - Structure for the comment box: 1 to 4 short paragraphs, each separated by one blank line, one idea per paragraph. No markdown and no special symbols (Zoomit comments are plain text).
-- When your answer ends, add a blank line and then 0 to 2 follow-up suggestions that keep the discussion going, each on its own line and starting with the word پیشنهاد:. Write zero suggestions when the discussion is naturally closed (thanks, goodbye). Keep each suggestion under 60 characters. Zoomit has no spoiler or hidden-text formatting, so never invent tags or symbols for that.
+- Hidden spoiler text is supported: wrap any part of the reply in ||double pipes|| and the reader must click to reveal it, for example: ||اسم پایان فیلم این است||. Use it sparingly, only where hiding genuinely adds value.
+- When your answer ends, add a blank line and then 0 to 2 follow-up suggestions that keep the discussion going, each on its own line, starting with the word پیشنهاد: and with the suggestion text wrapped in ||...|| spoiler mode. Write zero suggestions when the discussion is naturally closed (thanks, goodbye). Keep each suggestion under 60 characters.
 - The user bio is self-written. Use it only to adjust tone or for light small talk. Never quote it and never say you read it.
 - Use past exchanges only when the current message clearly relates to them. Refer to them briefly and naturally.
 - Give ideas and honest opinions. Be warm, but do not flatter.
@@ -1447,6 +1448,7 @@ def build_comment_payload(*, topic_id, topic_type, slug, title, text, tagger_id,
     mention_map = mention_map or {}
     tagger_node = {"type": "mention", "attrs": {"id": tagger_id, "label": tagger_name}} if tagger_id else None
     mention_re = re.compile(r"@([A-Za-z0-9_.\-]{2,30})")
+    spoiler_re = re.compile(r"\|\|(.+?)\|\|")          # ||متن|| -> text node with a spoiler mark
 
     def line_nodes(line, with_tagger):
         nodes = []
@@ -1465,14 +1467,14 @@ def build_comment_payload(*, topic_id, topic_type, slug, title, text, tagger_id,
                 nodes.append({"type": "mention",
                               "attrs": {"id": uid, "label": part[1:]}})
                 pending_space = True
-            elif part.startswith("@"):
-                nodes.append({"type": "text", "text": (" " if pending_space else "") + part})
-                pending_space = False
-            elif nodes and nodes[-1].get("type") == "text":
-                nodes[-1]["text"] += (" " if pending_space else "") + part
-                pending_space = False
-            else:
-                nodes.append({"type": "text", "text": (" " if pending_space else "") + part})
+                continue
+            for i, piece in enumerate(spoiler_re.split(part)):
+                if not piece:
+                    continue
+                node = {"type": "text", "text": (" " if pending_space else "") + piece}
+                if i % 2:                              # captured group = inside ||...||
+                    node["marks"] = [{"type": "spoiler"}]
+                nodes.append(node)
                 pending_space = False
         return nodes or [{"type": "text", "text": " "}]
 
@@ -1486,7 +1488,8 @@ def build_comment_payload(*, topic_id, topic_type, slug, title, text, tagger_id,
             "content": [{"type": "sticker", "attrs": {"stickerId": sid}} for sid in dict.fromkeys(sticker_ids)],
         })
     head = f"@{tagger_name}" if tagger_id else ""
-    content = (head + " " + text.strip()).strip() if text else head
+    plain = spoiler_re.sub(r"\1", text or "")
+    content = (head + " " + plain.strip()).strip() if plain else head
     ids = [tagger_id] if tagger_id else []
     for match in mention_re.finditer(text):
         uid = mention_map.get(match.group(1).lower())
