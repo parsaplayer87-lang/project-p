@@ -151,7 +151,7 @@ CB_EXTRA_HEADERS = env_json(
 KC_CHAT_URL = env("KILOCODE_CHAT_URL", "https://api.kilo.ai/api/openrouter/chat/completions")
 KC_MODELS = env_list(
     "KILOCODE_MODELS",
-    "nvidia/nemotron-3.5-super-vl:free,cohere/north-mini-code:free,dots-studio/dots-3-note-preview:free",
+    "dots-studio/dots-3-note-preview:free,cohere/north-mini-code:free",
 )
 KC_TOKENS = env_list("KILOCODE_TOKENS")     # comma-separated long-lived OAuth tokens, one per account
 
@@ -1028,6 +1028,7 @@ def parse_sse(lines):
 
 
 def call_route(route, messages):
+    max_tokens = AI_MAX_TOKENS
     if route["kind"] == "codebuddy":
         account = route["account"]
         seed = CB_REFRESH_SEEDS[account] if account < len(CB_REFRESH_SEEDS) else None
@@ -1046,6 +1047,9 @@ def call_route(route, messages):
         url = KC_CHAT_URL
         headers = {}
         headers["authorization"] = f"Bearer {KC_TOKENS[account]}"
+        # dots-3 thinks before it answers: its reasoning tokens share the
+        # completion budget, so a small cap truncates the reply mid-thought.
+        max_tokens = max(AI_MAX_TOKENS, 2500)
     else:
         provider = route["provider"]
         url = f"{provider['base_url']}/chat/completions"
@@ -1058,7 +1062,7 @@ def call_route(route, messages):
         "messages": messages,
         "temperature": 0.7,
         "top_p": 0.9,
-        "max_tokens": AI_MAX_TOKENS,
+        "max_tokens": max_tokens,
         "stream": True,
     }
     r = SESSION.post(url, data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
