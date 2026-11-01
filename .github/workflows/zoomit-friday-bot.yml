@@ -165,6 +165,7 @@ jobs:
           AI_TOTAL_BUDGET_SEC: ${{ vars.AI_TOTAL_BUDGET_SEC }}
           FORCE_IPV4: ${{ vars.FORCE_IPV4 || 'false' }}
           ZOOMIT_REFRESH_TOKEN: ${{ secrets.ZOOMIT_REFRESH_TOKEN }}
+          ZOOMIT_UPLOAD_REFRESH_TOKEN: ${{ secrets.ZOOMIT_UPLOAD_REFRESH_TOKEN }}
           CODEBUDDY_REFRESH_TOKENS: ${{ secrets.CODEBUDDY_REFRESH_TOKENS }}
           STATE_KEY: ${{ secrets.STATE_KEY }}
           AI_API_KEY: ${{ secrets.AI_API_KEY }}

@@ -123,6 +123,10 @@ ZOOMIT_TOKEN_URL = env("ZOOMIT_TOKEN_URL", "https://accounts.theforge.ir/connect
 ZOOMIT_CLIENT_ID = env("ZOOMIT_CLIENT_ID", "new-production-zoomit")
 ZOOMIT_SCOPE = env("ZOOMIT_SCOPE", "openid profile offline_access")
 ZOOMIT_REFRESH_SEED = env("ZOOMIT_REFRESH_TOKEN")
+# Throwaway account that owns uploaded images: an anonymous /media/profile upload
+# returns an uploadKey, but the picture only sticks in the media database once it
+# is attached to an account (PUT /profile/user-profiles, avatarUploadKey).
+ZOOMIT_UPLOAD_SEED = env("ZOOMIT_UPLOAD_REFRESH_TOKEN")
 
 # --- CodeBuddy (9router provider "codebuddy-intl") ---
 # Refresh goes through the plugin endpoint: the refresh token rides in the
@@ -1363,6 +1367,35 @@ def upload_order():
     return list(range(start, len(UPLOAD_CANDIDATES))) + list(range(0, start))
 
 
+def attach_upload_key(media_id):
+    """Connect the uploaded image to the throwaway account so it persists in the
+    media database and can be used as a stickerId. True when not configured."""
+    if not ZOOMIT_UPLOAD_SEED:
+        return True
+    try:
+        token = get_access_token("zoomit-upload", ZOOMIT_TOKEN_URL, ZOOMIT_CLIENT_ID,
+                                 ZOOMIT_UPLOAD_SEED, ZOOMIT_SCOPE)
+        r = SESSION.put(f"{API_BASE}/profile/user-profiles",
+                        data=json.dumps({
+                            "bio": None, "avatarUploadKey": media_id, "avatarType": "Custom",
+                            "deleteAvatar": False, "deleteCover": False,
+                            "favoriteBrands": [], "hatedBrands": [],
+                        }, ensure_ascii=False).encode("utf-8"),
+                        headers={"authorization": f"Bearer {token}",
+                                 "content-type": "application/json",
+                                 "accept": "application/json, text/plain, */*",
+                                 "referer": f"https://{SITE_HOST}/"},
+                        timeout=40)
+        if 200 <= r.status_code < 300:
+            log.info("uploadKey %s attached to the upload account", media_id)
+            return True
+        log.warning("avatar attach failed: HTTP %s", r.status_code)
+        return False
+    except Exception as e:
+        log.warning("avatar attach failed: %s", type(e).__name__)
+        return False
+
+
 def upload_sticker(image_bytes):
     mime = sniff_mime(image_bytes)
     for idx in upload_order():
@@ -1378,6 +1411,8 @@ def upload_sticker(image_bytes):
                 continue
             media_id = extract_media_id(r.text)
             if not media_id:
+                continue
+            if not attach_upload_key(media_id):
                 continue
             check = SESSION.get(f"{API_BASE}/media/{media_id}", params={"w": 64, "q": 50}, timeout=30)
             if check.status_code != 200:
