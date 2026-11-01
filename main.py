@@ -1071,6 +1071,9 @@ def call_route(route, messages):
         if r.status_code != 200:
             raise HTTPFail(r.status_code, r.text)
         if "text/event-stream" in r.headers.get("content-type", ""):
+            # SSE carries no charset: without this, requests decodes the lines
+            # as ISO-8859-1 and every Persian reply comes back as mojibake.
+            r.encoding = "utf-8"
             text = parse_sse(r.iter_lines(decode_unicode=True))
         else:
             text = r.json()["choices"][0]["message"]["content"]
