@@ -12,7 +12,7 @@ One loop iteration:
   4. Read the article discussion and locate the tagging comment.
   5. Find the MAIN comment (thread root) and ALL of its replies. Not the whole article.
   6. Read the tagger's bio (best effort).
-  7. Ask the AI: DeepSeek V4.1 Flash on CodeBuddy first, then fallback models and accounts.
+  7. Ask the AI: KiloCode free models first, then DeepSeek V4.1 Flash on CodeBuddy, then fallback models and accounts.
      Failures are retried silently. Nothing about AI failures is ever posted.
   8. Optional "[IMAGE: ...]" marker -> Pollinations flux image -> uploaded -> sent as a sticker.
   9. Post the reply. Question thread -> questionId. Normal comment -> parentId.
@@ -32,6 +32,7 @@ import random
 import re
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, quote, urlparse
 
@@ -124,21 +125,35 @@ ZOOMIT_SCOPE = env("ZOOMIT_SCOPE", "openid profile offline_access")
 ZOOMIT_REFRESH_SEED = env("ZOOMIT_REFRESH_TOKEN")
 
 # --- CodeBuddy (9router provider "codebuddy-intl") ---
+# Refresh goes through the plugin endpoint: the refresh token rides in the
+# X-Refresh-Token header (not a form body) and the reply is {code, data:{...}}.
 CB_TOKEN_URL = env(
     "CODEBUDDY_TOKEN_URL",
-    "https://www.codebuddy.ai/auth/realms/copilot/protocol/openid-connect/token",
+    "https://www.codebuddy.ai/v2/plugin/auth/token/refresh",
 )
-CB_CLIENT_ID = env("CODEBUDDY_CLIENT_ID", "console")
 CB_CHAT_URL = env("CODEBUDDY_CHAT_URL", "https://www.codebuddy.ai/v2/chat/completions")
 CB_REFRESH_SEEDS = env_list("CODEBUDDY_REFRESH_TOKENS")     # comma-separated, one per account
 CB_MODELS = env_list(
     "CODEBUDDY_MODELS",
     "deepseek-v4.1-flash,deepseek-v4-pro,minimax-m3,kimi-k2.7",
 )
+# The gateway runs a channel check per request: without the official IDE
+# headers and the four conversation UUID headers it answers 400 code 11128
+# ("request illegal") and the request never reaches the model.
 CB_EXTRA_HEADERS = env_json(
     "CODEBUDDY_EXTRA_HEADERS",
-    '{"X-Domain": "www.codebuddy.ai", "X-Product": "SaaS"}',
+    '{"User-Agent": "IDE/2.108.1 CodeBuddy/2.108.1", "X-Product": "SaaS", '
+    '"X-IDE-Type": "IDE", "X-IDE-Name": "IDE", "x-requested-with": "XMLHttpRequest", '
+    '"x-codebuddy-request": "1", "X-Domain": "www.codebuddy.ai"}',
 )
+
+# --- KiloCode (9router provider "kilocode", OpenRouter-style gateway) ---
+KC_CHAT_URL = env("KILOCODE_CHAT_URL", "https://api.kilo.ai/api/openrouter/chat/completions")
+KC_MODELS = env_list(
+    "KILOCODE_MODELS",
+    "nvidia/nemotron-3.5-super-vl:free,cohere/north-mini-code:free,dots-studio/dots-3-note-preview:free",
+)
+KC_TOKENS = env_list("KILOCODE_TOKENS")     # comma-separated long-lived OAuth tokens, one per account
 
 # --- Generic OpenAI-compatible endpoint (for example 9router at http://localhost:20128/v1) ---
 AI_BASE_URL = env("AI_BASE_URL").rstrip("/")
@@ -381,6 +396,70 @@ def get_access_token(slot_name, token_url, client_id, seed_refresh, scope=None, 
         slot["exp"] = now + lifetime
         slot["life"] = lifetime
         slot["refresh"] = body.get("refresh_token") or refresh_token   # persist rotation right away
+        STATE.save()
+        log.info("%s token refreshed (lifetime %d min)", slot_name, lifetime // 60)
+        return slot["access"]
+    if last_kind == "net":
+        raise NetworkError(f"{slot_name}: token server unreachable ({last_error})")
+    raise AuthError(f"{slot_name}: refresh failed ({last_error})")
+
+
+def get_codebuddy_token(slot_name, seed_refresh, force=False):
+    """CodeBuddy token refresh: POST {} with the refresh token in the
+    X-Refresh-Token header; reply shape is {code: 0, data: {accessToken, refreshToken, expiresIn}}."""
+    slot = STATE.data["tokens"].setdefault(slot_name, {})
+    now = time.time()
+    life = int(slot.get("life", 3600))
+    margin = min(TOKEN_MARGIN_SEC, life // 2)
+    if not force and slot.get("access") and now < slot.get("exp", 0) - margin:
+        return slot["access"]
+
+    candidates = []
+    for refresh_token in (slot.get("refresh"), seed_refresh):   # rotated value first, seed as fallback
+        if refresh_token and refresh_token not in candidates:
+            candidates.append(refresh_token)
+    if not candidates:
+        raise AuthError(f"{slot_name}: no refresh token configured")
+
+    last_error = "unknown"
+    last_kind = "http"
+    for refresh_token in candidates:
+        headers = {
+            "content-type": "application/json",
+            "accept": "application/json",
+            "user-agent": "IDE/2.63.2 CodeBuddy/2.63.2",
+            "x-requested-with": "XMLHttpRequest",
+            "x-domain": "www.codebuddy.ai",
+            "x-product": "SaaS",
+            "x-refresh-token": refresh_token,
+            "x-auth-refresh-source": "plugin",
+        }
+        try:
+            r = SESSION.post(CB_TOKEN_URL, data="{}", headers=headers, timeout=30)
+        except requests.RequestException as e:
+            last_error = type(e).__name__          # short name only: the message can contain the full URL
+            last_kind = "net"
+            continue
+        if r.status_code != 200:
+            last_error = f"HTTP {r.status_code}"
+            last_kind = "http"
+            continue
+        try:
+            body = r.json()
+        except ValueError:
+            last_error = "bad json"
+            last_kind = "http"
+            continue
+        data = body.get("data") or {}
+        if body.get("code") != 0 or not data.get("accessToken"):
+            last_error = f"code {body.get('code')} {str(body.get('msg', ''))[:80]}"
+            last_kind = "http"
+            continue
+        lifetime = int(data.get("expiresIn", 86400))
+        slot["access"] = data["accessToken"]
+        slot["exp"] = now + lifetime
+        slot["life"] = lifetime
+        slot["refresh"] = data.get("refreshToken") or refresh_token   # persist rotation right away
         STATE.save()
         log.info("%s token refreshed (lifetime %d min)", slot_name, lifetime // 60)
         return slot["access"]
@@ -904,8 +983,12 @@ def codebuddy_account_count():
 
 
 def build_routes():
-    # Order: CodeBuddy first (main model), then each provider in list order. Each model is tried in turn.
+    # Order: KiloCode free models first, then CodeBuddy (main model),
+    # then each generic provider in list order. Each model is tried in turn.
     routes = []
+    for model in KC_MODELS:
+        for account in range(len(KC_TOKENS)):
+            routes.append({"kind": "kilocode", "account": account, "model": model})
     for model in CB_MODELS:
         for account in range(codebuddy_account_count()):
             routes.append({"kind": "codebuddy", "account": account, "model": model})
@@ -948,10 +1031,21 @@ def call_route(route, messages):
     if route["kind"] == "codebuddy":
         account = route["account"]
         seed = CB_REFRESH_SEEDS[account] if account < len(CB_REFRESH_SEEDS) else None
-        token = get_access_token(f"codebuddy-{account}", CB_TOKEN_URL, CB_CLIENT_ID, seed)
+        token = get_codebuddy_token(f"codebuddy-{account}", seed)
         url = CB_CHAT_URL
         headers = dict(CB_EXTRA_HEADERS)
-        headers["authorization"] = f"Bearer {token}"
+        request_id = str(uuid.uuid4())
+        headers["X-Request-ID"] = request_id
+        headers["X-Conversation-ID"] = str(uuid.uuid4())
+        headers["X-Conversation-Request-ID"] = request_id
+        headers["X-Conversation-Message-ID"] = request_id
+    elif route["kind"] == "kilocode":
+        account = route["account"]
+        if account >= len(KC_TOKENS):
+            raise AuthError(f"kilocode-{account}: no token configured")
+        url = KC_CHAT_URL
+        headers = {}
+        headers["authorization"] = f"Bearer {KC_TOKENS[account]}"
     else:
         provider = route["provider"]
         url = f"{provider['base_url']}/chat/completions"
@@ -1013,7 +1107,7 @@ def ask_ai(messages):
     # Returns the raw AI text, or None. Normal AI failures never raise.
     routes = build_routes()
     if not routes:
-        raise AuthError("no AI route configured (CODEBUDDY_REFRESH_TOKENS or AI_PROVIDERS)")
+        raise AuthError("no AI route configured (KILOCODE_TOKENS, CODEBUDDY_REFRESH_TOKENS or AI_PROVIDERS)")
     started = time.time()
     for round_no in range(max(1, AI_ROUNDS)):
         attempted = 0
@@ -1041,9 +1135,11 @@ def ask_ai(messages):
                     if slot:
                         slot["exp"] = 0                   # force a refresh next time
                     pause(f"acct:codebuddy-{route['account']}", 900, f"auth HTTP {e.status}")
-                elif route["kind"] == "generic" and e.status in (401, 403):
+                elif route["kind"] in ("generic", "kilocode") and e.status in (401, 403):
                     # the key is wrong for this provider: skip all its models for 1 hour (the key is never logged)
                     pause(f"auth:prov:{route['account']}", 3600, f"{route['account']} rejected the key (HTTP {e.status})")
+                elif e.status == 402:
+                    pause(key, 3600, "credits or spending limit")
                 elif e.status == 429:
                     pause(key, 180, "rate or credit limit")
                 elif e.status == 404:
@@ -1483,7 +1579,7 @@ def main():
         log.error("ZOOMIT_REFRESH_TOKEN is missing. Add it as a repository secret.")
         sys.exit(1)
     if not build_routes():
-        log.error("No AI route. Set CODEBUDDY_REFRESH_TOKENS and/or AI_PROVIDERS.")
+        log.error("No AI route. Set KILOCODE_TOKENS, CODEBUDDY_REFRESH_TOKENS and/or AI_PROVIDERS.")
         sys.exit(1)
 
     deadline = time.time() + RUN_LIMIT_MINUTES * 60

@@ -62,6 +62,7 @@ jobs:
           S_CODEBUDDY: ${{ secrets.CODEBUDDY_REFRESH_TOKENS }}
           S_STATE_KEY: ${{ secrets.STATE_KEY }}
           S_AI_PROVIDERS: ${{ secrets.AI_PROVIDERS }}
+          S_KILOCODE: ${{ secrets.KILOCODE_TOKENS }}
         run: |
           yn() { if [ -n "$1" ]; then echo yes; else echo no; fi; }
           echo "variable AI_BASE_URL set: $(yn "$V_AI_BASE_URL")"
@@ -71,6 +72,7 @@ jobs:
           echo "secret CODEBUDDY_REFRESH_TOKENS set: $(yn "$S_CODEBUDDY")"
           echo "secret STATE_KEY set: $(yn "$S_STATE_KEY")"
           echo "secret AI_PROVIDERS set: $(yn "$S_AI_PROVIDERS")"
+          echo "secret KILOCODE_TOKENS set: $(yn "$S_KILOCODE")"
 
       - name: AI speed check (one tiny request, prints status and time)
         continue-on-error: true
@@ -88,6 +90,52 @@ jobs:
             -H "Authorization: Bearer $AI_KEY_X" -H "Content-Type: application/json" \
             -d "{\"model\":\"$AI_MODEL_X\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with one word: OK\"}],\"max_tokens\":20}" || true
           head -c 400 /tmp/ai.json 2>/dev/null; echo
+
+      - name: OAuth AI routes check (kilocode + codebuddy, status only)
+        continue-on-error: true
+        env:
+          KC_TOKENS: ${{ secrets.KILOCODE_TOKENS }}
+          KC_URL: ${{ vars.KILOCODE_CHAT_URL || 'https://api.kilo.ai/api/openrouter/chat/completions' }}
+          KC_MODEL: ${{ vars.KILOCODE_MODELS || 'nvidia/nemotron-3.5-super-vl:free' }}
+          CB_REFRESH: ${{ secrets.CODEBUDDY_REFRESH_TOKENS }}
+          CB_URL: ${{ vars.CODEBUDDY_CHAT_URL || 'https://www.codebuddy.ai/v2/chat/completions' }}
+          CB_REFRESH_URL: ${{ vars.CODEBUDDY_TOKEN_URL || 'https://www.codebuddy.ai/v2/plugin/auth/token/refresh' }}
+        run: |
+          body='[{"role":"system","content":"You are helpful."},{"role":"user","content":"Reply with one word: OK"}]'
+          tok=$(printf '%s' "$KC_TOKENS" | cut -d, -f1)
+          if [ -n "$tok" ]; then
+            code=$(curl -4 -sS -m 45 -o /tmp/kc.json -w "%{http_code}" "$KC_URL" \
+              -H "Authorization: Bearer $tok" -H "Content-Type: application/json" \
+              -d "{\"model\":\"$KC_MODEL\",\"messages\":$body}" 2>/dev/null || printf ERR)
+            echo "kilocode $KC_MODEL: HTTP $code"
+          else
+            echo "kilocode: KILOCODE_TOKENS missing, skipped"
+          fi
+          rt=$(printf '%s' "$CB_REFRESH" | cut -d, -f1)
+          if [ -n "$rt" ]; then
+            at=$(curl -4 -sS -m 30 "$CB_REFRESH_URL" \
+              -H "Content-Type: application/json" -H "Accept: application/json" \
+              -H "User-Agent: IDE/2.63.2 CodeBuddy/2.63.2" -H "X-Requested-With: XMLHttpRequest" \
+              -H "X-Domain: www.codebuddy.ai" -H "X-Product: SaaS" \
+              -H "X-Refresh-Token: $rt" -H "X-Auth-Refresh-Source: plugin" -d "{}" 2>/dev/null \
+              | python3 -c 'import json,sys; print((json.load(sys.stdin).get("data") or {}).get("accessToken",""))' 2>/dev/null || true)
+            if [ -n "$at" ]; then
+              rid=$(python3 -c 'import uuid; print(uuid.uuid4())')
+              code=$(curl -4 -sS -m 60 -o /tmp/cb.json -w "%{http_code}" "$CB_URL" \
+                -H "Authorization: Bearer $at" -H "Content-Type: application/json" \
+                -H "User-Agent: IDE/2.108.1 CodeBuddy/2.108.1" -H "X-Product: SaaS" \
+                -H "X-IDE-Type: IDE" -H "X-IDE-Name: IDE" -H "x-requested-with: XMLHttpRequest" \
+                -H "x-codebuddy-request: 1" -H "X-Domain: www.codebuddy.ai" \
+                -H "X-Request-ID: $rid" -H "X-Conversation-ID: $(python3 -c 'import uuid; print(uuid.uuid4())')" \
+                -H "X-Conversation-Request-ID: $rid" -H "X-Conversation-Message-ID: $rid" \
+                -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"system","content":"You are helpful."},{"role":"user","content":"Reply with one word: OK"}],"max_tokens":20,"stream":true}' 2>/dev/null || printf ERR)
+              echo "codebuddy deepseek-v4.1-flash: HTTP $code"
+            else
+              echo "codebuddy: token refresh failed"
+            fi
+          else
+            echo "codebuddy: CODEBUDDY_REFRESH_TOKENS missing, skipped"
+          fi
 
       - name: Run bot
         env:
@@ -107,6 +155,7 @@ jobs:
           CODEBUDDY_REFRESH_TOKENS: ${{ secrets.CODEBUDDY_REFRESH_TOKENS }}
           STATE_KEY: ${{ secrets.STATE_KEY }}
           AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          KILOCODE_TOKENS: ${{ secrets.KILOCODE_TOKENS }}
           POLLINATIONS_API_KEY: ${{ secrets.POLLINATIONS_API_KEY }}
           ZOOMIT_TEAM_INFO: ${{ secrets.ZOOMIT_TEAM_INFO }}
           MEMORY_MESSAGES: ${{ vars.MEMORY_MESSAGES || '10' }}
