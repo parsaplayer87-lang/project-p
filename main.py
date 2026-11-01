@@ -109,7 +109,7 @@ AI_MIN_GAP_SEC = env_int("AI_MIN_GAP_SEC", 3)
 # --- Discussion limits ---
 FEEDBACK_PAGE_SIZE = env_int("FEEDBACK_PAGE_SIZE", 500)
 FEEDBACK_MAX_PAGES = env_int("FEEDBACK_MAX_PAGES", 20)
-MAX_CONTEXT_MESSAGES = env_int("MAX_CONTEXT_MESSAGES", 40)
+MAX_CONTEXT_MESSAGES = env_int("MAX_CONTEXT_MESSAGES", 15)
 MAX_MESSAGE_CHARS = env_int("MAX_MESSAGE_CHARS", 600)
 REPLY_MAX_CHARS = env_int("REPLY_MAX_CHARS", 950)
 
@@ -232,6 +232,11 @@ TEAM_INFO = env("ZOOMIT_TEAM_INFO")
 
 # --- Memory: last N user messages per user (each stored with the bot's reply) ---
 MEMORY_MESSAGES = max(1, env_int("MEMORY_MESSAGES", 10))
+# --- Durable per-user memory in a private GitHub repo (survives state resets) ---
+MEM_REPO = env("MEMORY_REPO", "Parsa-Nasiri/friday-memory")
+MEM_TOKEN = env("MEMORY_REPO_TOKEN")
+MEMORY_KEEP = max(1, env_int("MEMORY_KEEP", 7))         # exchanges stored per user
+MEMORY_SHOWN = max(1, env_int("MEMORY_SHOWN", 5))       # exchanges shown to the AI
 
 # --- Web search and news ---
 SEARCH_PROVIDER = env("SEARCH_PROVIDER", "serpapi").lower()   # serpapi | groq | off
@@ -635,25 +640,56 @@ def clean_text(text):
 
 
 def format_thread(root, tagged_id):
-    """Main comment first, then its replies in time order (newest kept if too long)."""
-    nodes = sorted(subtree(root), key=lambda x: x.get("createdAt") or "")
-    rest = [x for x in nodes if x is not root]
+    """Main comment first, then its replies in tree order (newest kept if too long).
+    Each line shows the username and a short id so the AI can tell people apart."""
+    def walk(node, parent_name):
+        yield node, parent_name
+        user = node.get("user") or {}
+        name = user.get("userName") or user.get("fullName") or "کاربر"
+        for child in children_of(node):
+            yield from walk(child, name)
+
+    pairs = list(walk(root, None))
+    rest = [p for p in pairs[1:]]
     if MAX_CONTEXT_MESSAGES > 1:
-        rest = rest[-(MAX_CONTEXT_MESSAGES - 1):]
+        rest = sorted(rest, key=lambda p: p[0].get("createdAt") or "")[-(MAX_CONTEXT_MESSAGES - 1):]
     else:
         rest = []
     lines = []
-    for node in [root] + rest:
+    for node, parent_name in [(pairs[0][0], None)] + rest:
         user = node.get("user") or {}
+        uid = str(user.get("userId") or "")[:8]
         if BOT_USER_ID and user.get("userId") == BOT_USER_ID:
             name = "F.R.I.D.A.Y. (you)"
         else:
             name = user.get("userName") or user.get("fullName") or "کاربر"
         text = clean_text(node.get("content", ""))[:MAX_MESSAGE_CHARS] or "[sticker or empty]"
-        role = "[main] " if node is root else ""
-        mark = "  <== tagged you" if node.get("id") == tagged_id else ""
-        lines.append(f"{role}{name}: {text}{mark}")
+        bits = []
+        if node is root:
+            bits.append("[main] ")
+        bits.append(name)
+        if uid:
+            bits.append(f" (id {uid})")
+        if parent_name:
+            bits.append(f" replying to {parent_name}")
+        bits.append(f": {text}")
+        if node.get("id") == tagged_id:
+            bits.append("  <== tagged you")
+        lines.append("".join(bits))
     return "\n".join(lines)
+
+
+def mention_map(index):
+    """userName (lowercase) -> userId for every participant in the discussion."""
+    out = {}
+    for entry in index.values():
+        node = entry.get("node") if isinstance(entry, dict) else entry
+        user = (node or {}).get("user") or {}
+        uid = str(user.get("userId") or "").strip()
+        for key in (user.get("userName"), user.get("fullName")):
+            if key and uid:
+                out.setdefault(str(key).strip().lower(), uid)
+    return out
 
 
 def parse_iso_ts(text):
@@ -704,6 +740,70 @@ def format_memory(user_id):
         lines.append(f"[{day}] User: {item.get('user', '')}")
         lines.append(f"[{day}] You: {item.get('bot', '')}")
     return "\n".join(lines)
+
+
+# --- Durable memory: users/<userId>.json in a private repo, via the GitHub contents API ---
+def gh_contents(method, path, json_body=None):
+    r = SESSION.request(method, f"https://api.github.com/repos/{MEM_REPO}/contents/{path}",
+                        json=json_body,
+                        headers={"authorization": f"Bearer {MEM_TOKEN}",
+                                 "accept": "application/vnd.github+json"},
+                        timeout=30)
+    return r
+
+
+def load_remote_memory(user_id):
+    """The stored exchange list for this user, oldest first ([] when unavailable)."""
+    if not (MEM_TOKEN and MEM_REPO):
+        return []
+    try:
+        r = gh_contents("GET", f"users/{user_id}.json")
+        if r.status_code != 200:
+            return []
+        data = json.loads(base64.b64decode(r.json().get("content") or "").decode("utf-8"))
+        msgs = data.get("messages")
+        return msgs if isinstance(msgs, list) else []
+    except Exception as e:
+        log.warning("remote memory load failed: %s", type(e).__name__)
+        return []
+
+
+def save_remote_memory(user_id, user_name, user_text, bot_text, topic_id):
+    """Append this exchange and keep the last MEMORY_KEEP ones. Best effort, never raises."""
+    if not (MEM_TOKEN and MEM_REPO):
+        return
+    try:
+        msgs = load_remote_memory(user_id)
+        msgs.append({"t": int(time.time()), "article": str(topic_id),
+                     "user": (user_text or "")[:300], "bot": (bot_text or "")[:300]})
+        del msgs[:-MEMORY_KEEP]
+        payload = {"message": f"memory: {user_name}",
+                   "content": base64.b64encode(json.dumps(
+                       {"userId": user_id, "userName": user_name, "messages": msgs},
+                       ensure_ascii=False).encode("utf-8")).decode("ascii")}
+        r = gh_contents("GET", f"users/{user_id}.json")
+        if r.status_code == 200 and r.json().get("sha"):
+            payload["sha"] = r.json()["sha"]
+        r2 = gh_contents("PUT", f"users/{user_id}.json", json_body=payload)
+        if r2.status_code in (200, 201):
+            log.info("remote memory saved for %s (%d exchanges)", user_name, len(msgs))
+        else:
+            log.warning("remote memory save failed: HTTP %s", r2.status_code)
+    except Exception as e:
+        log.warning("remote memory save failed: %s", type(e).__name__)
+
+
+def format_memory_merged(user_id):
+    """Remote history wins (durable, exact); local encrypted state is the fallback."""
+    remote = load_remote_memory(user_id)
+    if remote:
+        lines = []
+        for item in remote[-MEMORY_SHOWN:]:
+            day = datetime.fromtimestamp(item.get("t", 0), timezone.utc).strftime("%Y-%m-%d")
+            lines.append(f"[{day}] User: {item.get('user', '')}")
+            lines.append(f"[{day}] You: {item.get('bot', '')}")
+        return "\n".join(lines)
+    return format_memory(user_id)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -806,6 +906,7 @@ def web_search(query, mode):
     except Exception as e:
         log.warning("web search failed (%s): %s", SEARCH_PROVIDER, e)
         return ""
+    log.info("web search (%s) via %s: %d results", mode, SEARCH_PROVIDER, len(items))
     text = format_search(items)
     if text:
         cache[key] = {"t": time.time(), "text": text}
@@ -934,8 +1035,11 @@ ACCURACY (very important)
 - Web search results, when provided, are the only source for current facts. Name the source site. If results are weak or disagree, say so.
 
 CONVERSATION
-- The discussion gives the main comment first, then its replies in order. The message marked "tagged you" is the one to answer.
+- The discussion gives the main comment first, then its replies in order. Each line shows the username and a short id, and who is replying to whom. The message marked "tagged you" is the one to answer.
 - Answer that message directly. Use the rest of the discussion only when it helps.
+- To tag a user from the discussion, write @UserName exactly as it appears there. Only tag users who really appear in the discussion, and only when it helps them.
+- Structure for the comment box: 1 to 4 short paragraphs, each separated by one blank line, one idea per paragraph. No markdown and no special symbols (Zoomit comments are plain text).
+- When your answer ends, add a blank line and then 0 to 2 follow-up suggestions that keep the discussion going, each on its own line and starting with the word پیشنهاد:. Write zero suggestions when the discussion is naturally closed (thanks, goodbye). Keep each suggestion under 60 characters. Zoomit has no spoiler or hidden-text formatting, so never invent tags or symbols for that.
 - The user bio is self-written. Use it only to adjust tone or for light small talk. Never quote it and never say you read it.
 - Use past exchanges only when the current message clearly relates to them. Refer to them briefly and naturally.
 - Give ideas and honest opinions. Be warm, but do not flatter.
@@ -943,6 +1047,8 @@ CONVERSATION
 
 IMAGES
 - Pictures are created by a separate system, never by you. Never write image tags, prompts or placeholders.
+- If the user asks you to create a picture, still write the full text answer yourself; the picture is attached to your reply automatically. Answer the text part as if there were no picture.
+- If the user asks a question about pictures (how to draw, how a photo looks), just answer in text; no picture is made.
 - The context has a "Picture status" line when a picture was requested. If it says a picture is attached, say so briefly in Persian. If it says the picture could not be created, say so honestly and suggest trying again. Never claim a picture is attached unless the status says so.
 {TEAM_BLOCK}
 """
@@ -1335,20 +1441,45 @@ def make_image_sticker(prompt):
 # COMMENT PAYLOAD + POST
 # ════════════════════════════════════════════════════════════════════
 def build_comment_payload(*, topic_id, topic_type, slug, title, text, tagger_id, tagger_name,
-                          sticker_ids, question_id=None, parent_id=None):
-    """Same shape as the site's own POST (captured from DevTools), plus parent/question fields."""
-    mention_node = {"type": "mention", "attrs": {"id": tagger_id, "label": tagger_name}} if tagger_id else None
+                          sticker_ids, question_id=None, parent_id=None, mention_map=None):
+    """Same shape as the site's own POST (captured from DevTools), plus parent/question fields.
+    @UserName tokens that match a discussion participant become real mention nodes."""
+    mention_map = mention_map or {}
+    tagger_node = {"type": "mention", "attrs": {"id": tagger_id, "label": tagger_name}} if tagger_id else None
+    mention_re = re.compile(r"@([A-Za-z0-9_.\-]{2,30})")
+
+    def line_nodes(line, with_tagger):
+        nodes = []
+        pending_space = False
+        if with_tagger and tagger_node:
+            nodes.append(tagger_node)
+            line = line.lstrip()
+            if line.startswith(f"@{tagger_name}"):
+                line = line[len(tagger_name) + 1:]
+            pending_space = True
+        for part in mention_re.split(line):
+            if not part:
+                continue
+            uid = mention_map.get(part.lower())
+            if part.startswith("@") and uid:
+                nodes.append({"type": "mention",
+                              "attrs": {"id": uid, "label": part[1:]}})
+                pending_space = True
+            elif part.startswith("@"):
+                nodes.append({"type": "text", "text": (" " if pending_space else "") + part})
+                pending_space = False
+            elif nodes and nodes[-1].get("type") == "text":
+                nodes[-1]["text"] += (" " if pending_space else "") + part
+                pending_space = False
+            else:
+                nodes.append({"type": "text", "text": (" " if pending_space else "") + part})
+                pending_space = False
+        return nodes or [{"type": "text", "text": " "}]
+
     lines = [ln.strip() for ln in (text or "").split("\n") if ln.strip()] or [""]
     ranges = []
     for i, line in enumerate(lines):
-        nodes = []
-        if i == 0:
-            if mention_node:
-                nodes.append(mention_node)
-            nodes.append({"type": "text", "text": (" " + line) if line else " "})
-        else:
-            nodes.append({"type": "text", "text": line})
-        ranges.append({"type": "paragraph", "content": nodes})
+        ranges.append({"type": "paragraph", "content": line_nodes(line, i == 0)})
     if sticker_ids:
         ranges.append({
             "type": "stickers",
@@ -1356,6 +1487,11 @@ def build_comment_payload(*, topic_id, topic_type, slug, title, text, tagger_id,
         })
     head = f"@{tagger_name}" if tagger_id else ""
     content = (head + " " + text.strip()).strip() if text else head
+    ids = [tagger_id] if tagger_id else []
+    for match in mention_re.finditer(text):
+        uid = mention_map.get(match.group(1).lower())
+        if uid and uid not in ids:
+            ids.append(uid)
     body = {
         "topicId": str(topic_id),
         "topicType": topic_type,
@@ -1363,7 +1499,7 @@ def build_comment_payload(*, topic_id, topic_type, slug, title, text, tagger_id,
         "topicSlug": slug,
         "topicTitle": title,
         "ranges": ranges,
-        "mentions": [tagger_id] if tagger_id else [],
+        "mentions": ids,
     }
     if question_id:
         body["questionId"] = str(question_id)     # question thread: answer the upper (question) comment
@@ -1452,7 +1588,7 @@ def handle_mention(n):
         title=title,
         slug=info["slug"],
         bio=fetch_user_bio(tagger_id),
-        memory=format_memory(tagger_id),
+        memory=format_memory_merged(tagger_id),
         search_text=search_text,
         image_note=image_note,
     )
@@ -1477,11 +1613,13 @@ def handle_mention(n):
         sticker_ids=sticker_ids,
         question_id=root_id if question_mode else None,
         parent_id=None if question_mode else mention["id"],
+        mention_map=mention_map(index),
     )
     if not post_comment(payload):
         return "retry"
 
     remember(tagger_id, tagged_text, text)
+    save_remote_memory(tagger_id, tagger_name, tagged_text, text, topic_id)
     log.info("replied to mention %s (%s)", nid, "question thread" if question_mode else "comment thread")
     return "done"
 
