@@ -233,7 +233,7 @@ TEAM_INFO = env("ZOOMIT_TEAM_INFO")
 # --- Memory: last N user messages per user (each stored with the bot's reply) ---
 MEMORY_MESSAGES = max(1, env_int("MEMORY_MESSAGES", 10))
 # --- Durable per-user memory in a private GitHub repo (survives state resets) ---
-MEM_REPO = env("MEMORY_REPO", "Parsa-Nasiri/friday-memory")
+MEM_REPO = env("MEMORY_REPO", "parsaplayer87-lang/friday-memory")
 MEM_TOKEN = env("MEMORY_REPO_TOKEN")
 MEMORY_KEEP = max(1, env_int("MEMORY_KEEP", 7))         # exchanges stored per user
 MEMORY_SHOWN = max(1, env_int("MEMORY_SHOWN", 5))       # exchanges shown to the AI
