@@ -26,18 +26,24 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
 
       - name: Install dependencies
-        run: pip install requests cryptography
+        run: pip install --quiet -r requirements.txt
 
       - name: Network check (shows which APIs this runner can reach)
         continue-on-error: true
         run: |
+          check() {
+            v4=$(curl -4 -s -o /dev/null -w "%{http_code}" --connect-timeout 10 --max-time 20 "$1" || true)
+            any=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 10 --max-time 20 "$1" || true)
+            echo "IPv4=$v4  default=$any  $1"
+          }
           for url in https://www.codebuddy.ai/ https://accounts.theforge.ir/ https://api2.zoomit.ir/ https://serpapi.com/ https://gen.pollinations.ai/ https://openrouter.ai/api/v1/models; do
-            v4=$(curl -4 -s -o /dev/null -w "%{http_code}" --connect-timeout 10 --max-time 20 "$url" || true)
-            any=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 10 --max-time 20 "$url" || true)
-            echo "IPv4=$v4  default=$any  $url"
+            check "$url" &
           done
+          wait
 
       - name: Restore bot state (encrypted)
         uses: actions/cache/restore@v4
@@ -77,7 +83,7 @@ jobs:
             echo "AI_BASE_URL or AI_API_KEY is missing, check skipped"
             exit 0
           fi
-          curl -sS -m 150 -o /tmp/ai.json -w "HTTP %{http_code} in %{time_total}s\n" \
+          curl -sS -m 60 -o /tmp/ai.json -w "HTTP %{http_code} in %{time_total}s\n" \
             "$AI_URL_X/chat/completions" \
             -H "Authorization: Bearer $AI_KEY_X" -H "Content-Type: application/json" \
             -d "{\"model\":\"$AI_MODEL_X\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with one word: OK\"}],\"max_tokens\":20}" || true
