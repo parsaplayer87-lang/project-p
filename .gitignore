@@ -1,0 +1,10 @@
+# node deps for the duck.ai challenge solver (installed by the workflow)
+node_modules/
+package-lock.json
+
+# python
+__pycache__/
+*.pyc
+
+# bot state (encrypted tokens, memory) - lives in the Actions cache, never in git
+data/

@@ -1,0 +1,10 @@
+{
+  "name": "friday-duckai",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Node dependency for duckai_client.py: jsdom runs the duck.ai anti-abuse challenge",
+  "main": "jsa_jsdom.js",
+  "dependencies": {
+    "jsdom": "^31.0.0"
+  }
+}

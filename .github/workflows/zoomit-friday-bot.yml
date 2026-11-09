@@ -23,6 +23,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # duck.ai solves its anti-abuse challenge with jsdom, so Node is a hard runtime
+      # dependency of the gpt-6-luna route. Without it the route fails and the bot
+      # falls back to KiloCode / CodeBuddy.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -30,7 +37,9 @@ jobs:
           cache-dependency-path: requirements.txt
 
       - name: Install dependencies
-        run: pip install --quiet -r requirements.txt
+        run: |
+          pip install --quiet -r requirements.txt
+          npm install --no-audit --no-fund
 
       - name: Network check (shows which APIs this runner can reach)
         continue-on-error: true
@@ -40,7 +49,7 @@ jobs:
             any=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 10 --max-time 20 "$1" || true)
             echo "IPv4=$v4  default=$any  $1"
           }
-          for url in https://www.codebuddy.ai/ https://accounts.theforge.ir/ https://api2.zoomit.ir/ https://serpapi.com/ https://gen.pollinations.ai/ https://openrouter.ai/api/v1/models; do
+          for url in https://www.codebuddy.ai/ https://accounts.theforge.ir/ https://api2.zoomit.ir/ https://serpapi.com/ https://gen.pollinations.ai/ https://duck.ai/ https://openrouter.ai/api/v1/models; do
             check "$url" &
           done
           wait
@@ -64,6 +73,7 @@ jobs:
           S_AI_PROVIDERS: ${{ secrets.AI_PROVIDERS }}
           S_KILOCODE: ${{ secrets.KILOCODE_TOKENS }}
           S_MEMORY: ${{ secrets.MEMORY_REPO_TOKEN }}
+          DUCKAI_ENABLED: ${{ vars.DUCKAI_ENABLED || 'true' }}
         run: |
           yn() { if [ -n "$1" ]; then echo yes; else echo no; fi; }
           echo "variable AI_BASE_URL set: $(yn "$V_AI_BASE_URL")"
@@ -75,6 +85,37 @@ jobs:
           echo "secret AI_PROVIDERS set: $(yn "$S_AI_PROVIDERS")"
           echo "secret KILOCODE_TOKENS set: $(yn "$S_KILOCODE")"
           echo "secret MEMORY_REPO_TOKEN set: $(yn "$S_MEMORY")"
+          echo "duck.ai enabled: $DUCKAI_ENABLED"
+          echo "node on PATH: $(node --version 2>/dev/null || echo MISSING)"
+          echo "jsdom installed: $(test -d node_modules/jsdom && echo yes || echo no)"
+
+      - name: duck.ai route check (gpt-6-luna text and image, status only)
+        continue-on-error: true
+        env:
+          DUCKAI_ENABLED: ${{ vars.DUCKAI_ENABLED || 'true' }}
+          DUCKAI_TEXT_MODEL: ${{ vars.DUCKAI_TEXT_MODEL || 'gpt-6-luna' }}
+        run: |
+          if [ "$(printf '%s' "$DUCKAI_ENABLED" | tr 'A-Z' 'a-z')" = "false" ]; then
+            echo "duck.ai: disabled by DUCKAI_ENABLED, skipped"; exit 0
+          fi
+          python - <<'PY'
+          import os
+          import time
+          import duckai_client as dc
+          model = os.getenv("DUCKAI_TEXT_MODEL") or "gpt-6-luna"
+          client = dc.get_client(timeout=90)
+          try:
+              t = time.time()
+              print("duck.ai text %s: %r (%.0fs)" % (model, client.ask("Reply with one word: OK", model=model, retries=2)[:40], time.time() - t))
+          except Exception as e:
+              print("duck.ai text FAILED: %s %s" % (type(e).__name__, str(e)[:200]))
+          try:
+              t = time.time()
+              img = client.draw("a tiny blue robot", model=model, retries=2)
+              print("duck.ai image: %s bytes (%.0fs)" % (len(img) if img else "no image", time.time() - t))
+          except Exception as e:
+              print("duck.ai image FAILED: %s %s" % (type(e).__name__, str(e)[:200]))
+          PY
 
       - name: AI speed check (one tiny request, prints status and time)
         continue-on-error: true
@@ -171,6 +212,9 @@ jobs:
           AI_API_KEY: ${{ secrets.AI_API_KEY }}
           KILOCODE_TOKENS: ${{ secrets.KILOCODE_TOKENS }}
           MEMORY_REPO_TOKEN: ${{ secrets.MEMORY_REPO_TOKEN }}
+          DUCKAI_ENABLED: ${{ vars.DUCKAI_ENABLED || 'true' }}
+          DUCKAI_TEXT_MODEL: ${{ vars.DUCKAI_TEXT_MODEL || 'gpt-6-luna' }}
+          DUCKAI_TIMEOUT_SEC: ${{ vars.DUCKAI_TIMEOUT_SEC }}
           POLLINATIONS_API_KEY: ${{ secrets.POLLINATIONS_API_KEY }}
           ZOOMIT_TEAM_INFO: ${{ secrets.ZOOMIT_TEAM_INFO }}
           MEMORY_MESSAGES: ${{ vars.MEMORY_MESSAGES || '10' }}
