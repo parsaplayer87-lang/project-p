@@ -28,7 +28,7 @@ jobs:
       # falls back to KiloCode / CodeBuddy.
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
 
       - uses: actions/setup-python@v5
         with:
@@ -73,7 +73,12 @@ jobs:
           S_AI_PROVIDERS: ${{ secrets.AI_PROVIDERS }}
           S_KILOCODE: ${{ secrets.KILOCODE_TOKENS }}
           S_MEMORY: ${{ secrets.MEMORY_REPO_TOKEN }}
+          S_SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          V_SUPABASE_URL: ${{ vars.SUPABASE_URL }}
           DUCKAI_ENABLED: ${{ vars.DUCKAI_ENABLED || 'true' }}
+          DUCKAI_WEB_SEARCH: ${{ vars.DUCKAI_WEB_SEARCH || 'true' }}
+          DUCKAI_REASONING_EFFORT: ${{ vars.DUCKAI_REASONING_EFFORT || 'low' }}
+          BANNER_WIDTH: ${{ vars.IMAGE_BANNER_WIDTH || '828' }}
         run: |
           yn() { if [ -n "$1" ]; then echo yes; else echo no; fi; }
           echo "variable AI_BASE_URL set: $(yn "$V_AI_BASE_URL")"
@@ -85,36 +90,113 @@ jobs:
           echo "secret AI_PROVIDERS set: $(yn "$S_AI_PROVIDERS")"
           echo "secret KILOCODE_TOKENS set: $(yn "$S_KILOCODE")"
           echo "secret MEMORY_REPO_TOKEN set: $(yn "$S_MEMORY")"
+          echo "secret SUPABASE_KEY set: $(yn "$S_SUPABASE_KEY")"
+          echo "variable SUPABASE_URL set: $(yn "$V_SUPABASE_URL")"
           echo "duck.ai enabled: $DUCKAI_ENABLED"
+          echo "duck.ai web search: $DUCKAI_WEB_SEARCH, reasoning effort: $DUCKAI_REASONING_EFFORT"
+          echo "article banner width: $BANNER_WIDTH"
           echo "node on PATH: $(node --version 2>/dev/null || echo MISSING)"
           echo "jsdom installed: $(test -d node_modules/jsdom && echo yes || echo no)"
+          echo "pillow installed: $(python -c 'import PIL; print(PIL.__version__)' 2>/dev/null || echo no)"
 
-      - name: duck.ai route check (gpt-6-luna text and image, status only)
+      - name: duck.ai route check (gpt-6-luna text, search, image and banner edit, status only)
         continue-on-error: true
         env:
           DUCKAI_ENABLED: ${{ vars.DUCKAI_ENABLED || 'true' }}
           DUCKAI_TEXT_MODEL: ${{ vars.DUCKAI_TEXT_MODEL || 'gpt-6-luna' }}
+          DUCKAI_WEB_SEARCH: ${{ vars.DUCKAI_WEB_SEARCH || 'true' }}
+          DUCKAI_REASONING_EFFORT: ${{ vars.DUCKAI_REASONING_EFFORT || 'low' }}
+          BANNER_WIDTH: ${{ vars.IMAGE_BANNER_WIDTH || '828' }}
         run: |
           if [ "$(printf '%s' "$DUCKAI_ENABLED" | tr 'A-Z' 'a-z')" = "false" ]; then
             echo "duck.ai: disabled by DUCKAI_ENABLED, skipped"; exit 0
           fi
           python - <<'PY'
+          import html
           import os
+          import re
           import time
+          import requests
           import duckai_client as dc
           model = os.getenv("DUCKAI_TEXT_MODEL") or "gpt-6-luna"
+          effort = os.getenv("DUCKAI_REASONING_EFFORT") or "low"
           client = dc.get_client(timeout=90)
           try:
               t = time.time()
-              print("duck.ai text %s: %r (%.0fs)" % (model, client.ask("Reply with one word: OK", model=model, retries=2)[:40], time.time() - t))
+              print("duck.ai text %s (reasoning %s): %r (%.0fs)" % (
+                  model, effort,
+                  client.ask("Reply with one word: OK", model=model, retries=2)[:40],
+                  time.time() - t))
           except Exception as e:
               print("duck.ai text FAILED: %s %s" % (type(e).__name__, str(e)[:200]))
+          try:
+              t = time.time()
+              txt = client.ask("What is the latest stable Python version? "
+                               "One line with the source.", model=model, retries=2, search=True)
+              print("duck.ai web search: %r (%.0fs)" % (txt[:120], time.time() - t))
+          except Exception as e:
+              print("duck.ai web search FAILED: %s %s" % (type(e).__name__, str(e)[:200]))
           try:
               t = time.time()
               img = client.draw("a tiny blue robot", model=model, retries=2)
               print("duck.ai image: %s bytes (%.0fs)" % (len(img) if img else "no image", time.time() - t))
           except Exception as e:
               print("duck.ai image FAILED: %s %s" % (type(e).__name__, str(e)[:200]))
+          try:
+              target = int(os.getenv("BANNER_WIDTH") or "828")
+              page = requests.get("https://www.zoomit.ir/ai-articles/470750-jensen-huang-nvidia-china-spy-scandal/",
+                                  timeout=40, headers={"accept": "text/html"})
+              tag = re.search(r"<link[^>]+rel=\"preload\"[^>]+as=\"image\"[^>]+>", page.text)
+              srcset = re.search(r'imageSrcSet="([^"]+)"', tag.group(0)) if tag else None
+              pairs = []
+              for part in html.unescape(srcset.group(1)).split(",") if srcset else []:
+                  bits = part.split()
+                  if len(bits) > 1 and bits[1].endswith("w"):
+                      pairs.append((int(bits[1][:-1]), bits[0]))
+              width, url = min(pairs, key=lambda p: abs(p[0] - target)) if pairs else (0, "")
+              print("banner srcset: %d sizes, picked %dw" % (len(pairs), width))
+              image = requests.get(url, timeout=60) if url else None
+              if image is not None and image.status_code == 200:
+                  t = time.time()
+                  out = client.draw("Turn this image into a soft watercolour painting. Keep the composition.",
+                                    model=model, retries=2, image=(image.content, "image/webp"))
+                  print("duck.ai banner edit: %s bytes (%.0fs)" % (
+                      len(out) if out else "no image", time.time() - t))
+              else:
+                  print("duck.ai banner edit skipped: banner download failed")
+          except Exception as e:
+              print("duck.ai banner edit FAILED: %s %s" % (type(e).__name__, str(e)[:200]))
+          PY
+
+      - name: Sandbox check (codespace token, scope and SSH public key)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.CODESPACE_TOKEN }}
+          AGENT_TOOLS: ${{ vars.AGENT_TOOLS || 'false' }}
+          AGENT_ALLOWLIST: ${{ vars.AGENT_ALLOWLIST }}
+          CODESPACE_SSH_KEY: ${{ secrets.CODESPACE_SSH_KEY }}
+          CODESPACE_REPO: ${{ vars.CODESPACE_REPO || 'parsaplayer87-lang/friday-sandbox' }}
+          SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          echo "agent enabled: $AGENT_TOOLS, allowlist: ${AGENT_ALLOWLIST:-empty}"
+          if [ -n "$SUPABASE_URL" ] && [ -n "$SUPABASE_KEY" ]; then
+            echo "file sharing (supabase): configured"
+          else
+            echo "file sharing (supabase): off (SUPABASE_URL or SUPABASE_KEY missing)"
+          fi
+          if [ -z "$GH_TOKEN" ]; then echo "CODESPACE_TOKEN missing, sandbox disabled"; exit 0; fi
+          echo "gh account: $(gh api user --jq .login 2>&1)"
+          echo "scopes: $(gh api -i user 2>/dev/null | grep -i '^x-oauth-scopes' | tr -d '\r' || echo unknown)"
+          echo "sandbox repo $CODESPACE_REPO: $(gh api "repos/$CODESPACE_REPO" --jq .full_name 2>&1)"
+          echo "existing codespaces: $(gh api user/codespaces --jq '.codespaces | length' 2>&1)"
+          python - <<'PY'
+          import os
+          import codespace_runner as cs
+          pub = cs.public_key(os.getenv("CODESPACE_SSH_KEY") or "")
+          print("ssh public key (gh installs it in the codespace itself; add it at "
+                "https://github.com/settings/keys only if ssh fails with 'Permission denied'):")
+          print(pub or "(none: CODESPACE_SSH_KEY missing or ssh-keygen not available)")
           PY
 
       - name: AI speed check (one tiny request, prints status and time)
@@ -215,6 +297,28 @@ jobs:
           DUCKAI_ENABLED: ${{ vars.DUCKAI_ENABLED || 'true' }}
           DUCKAI_TEXT_MODEL: ${{ vars.DUCKAI_TEXT_MODEL || 'gpt-6-luna' }}
           DUCKAI_TIMEOUT_SEC: ${{ vars.DUCKAI_TIMEOUT_SEC }}
+          DUCKAI_WEB_SEARCH: ${{ vars.DUCKAI_WEB_SEARCH || 'true' }}
+          DUCKAI_REASONING_EFFORT: ${{ vars.DUCKAI_REASONING_EFFORT || 'low' }}
+          IMAGE_BANNER_WIDTH: ${{ vars.IMAGE_BANNER_WIDTH || '828' }}
+          AGENT_TOOLS: ${{ vars.AGENT_TOOLS || 'false' }}
+          AGENT_ALLOWLIST: ${{ vars.AGENT_ALLOWLIST }}
+          AGENT_MAX_STEPS: ${{ vars.AGENT_MAX_STEPS || '4' }}
+          AGENT_STEP_MAX_SEC: ${{ vars.AGENT_STEP_MAX_SEC || '90' }}
+          AGENT_OUTPUT_MAX_CHARS: ${{ vars.AGENT_OUTPUT_MAX_CHARS || '3000' }}
+          AGENT_START_BUDGET_SEC: ${{ vars.AGENT_START_BUDGET_SEC || '300' }}
+          CODESPACE_NAME: ${{ vars.CODESPACE_NAME || 'friday-sandbox' }}
+          CODESPACE_REPO: ${{ vars.CODESPACE_REPO || 'parsaplayer87-lang/friday-sandbox' }}
+          CODESPACE_MACHINE: ${{ vars.CODESPACE_MACHINE || 'basicLinux32gb' }}
+          CODESPACE_IDLE_MIN: ${{ vars.CODESPACE_IDLE_MIN || '10' }}
+          CODESPACE_TOKEN: ${{ secrets.CODESPACE_TOKEN }}
+          CODESPACE_SSH_KEY: ${{ secrets.CODESPACE_SSH_KEY }}
+          SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          SUPABASE_BUCKET: ${{ vars.SUPABASE_BUCKET || 'friday' }}
+          SUPABASE_PUBLIC: ${{ vars.SUPABASE_PUBLIC || 'false' }}
+          SUPABASE_URL_TTL_DAYS: ${{ vars.SUPABASE_URL_TTL_DAYS || '7' }}
+          SUPABASE_MAX_BYTES: ${{ vars.SUPABASE_MAX_BYTES || '6291456' }}
+          SHARE_MAX_FILES: ${{ vars.SHARE_MAX_FILES || '3' }}
           POLLINATIONS_API_KEY: ${{ secrets.POLLINATIONS_API_KEY }}
           ZOOMIT_TEAM_INFO: ${{ secrets.ZOOMIT_TEAM_INFO }}
           MEMORY_MESSAGES: ${{ vars.MEMORY_MESSAGES || '10' }}
