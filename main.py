@@ -132,8 +132,7 @@ BOT_USER_ID = env("BOT_USER_ID")                            # optional override,
 DRY_RUN = env_bool("DRY_RUN", False)                        # True = log payloads, post nothing
 RUN_LIMIT_MINUTES = env_int("RUN_LIMIT_MINUTES", 345)       # stop before the 6h GitHub job limit
 CHECK_INTERVAL_SEC = env_int("CHECK_INTERVAL_SEC", 60)
-MAX_NOTIF_AGE_HOURS = env_int("MAX_NOTIF_AGE_HOURS", 12)    # never answer very old mentions
-MAX_ATTEMPTS_PER_NOTIF = env_int("MAX_ATTEMPTS_PER_NOTIF", 120)   # ~2h of 60s cycles, so a long outage does not drop mentions
+MAX_ATTEMPTS_PER_NOTIF = env_int("MAX_ATTEMPTS_PER_NOTIF", 120)
 AI_MIN_GAP_SEC = env_int("AI_MIN_GAP_SEC", 3)
 
 # --- Discussion limits ---
@@ -615,9 +614,7 @@ def fetch_unread():
             if n.get("id") and n["id"] not in seen:
                 seen.add(n["id"])
                 items.append(n)
-        done = set(STATE.data["processed"])
-        # go on to the next page only when this whole page is already handled (new items may be further down)
-        if not data.get("hasNext") or any(n.get("id") not in done for n in page_items):
+        if not data.get("hasNext"):
             break
     return items
 
@@ -2211,17 +2208,12 @@ def post_comment(body):
 # PIPELINE: one mention -> one reply
 # ════════════════════════════════════════════════════════════════════
 def handle_mention(n):
-    """Returns 'done' (finished or skipped) or 'retry'. Never posts an error message."""
+    """Returns 'done' for posted, already-answered or self mentions; otherwise 'retry'."""
     nid = n.get("id")
-    ts = parse_iso_ts(n.get("occuredAt") or n.get("occurredAt"))
-    if ts and time.time() - ts > MAX_NOTIF_AGE_HOURS * 3600:
-        log.info("skip old mention %s", nid)
-        return "done"
-
     info = parse_mention_link((n.get("link") or {}).get("url", ""))
     if not info or not info["feedback_id"]:
-        log.warning("cannot parse link of mention %s", nid)
-        return "done"
+        log.warning("cannot parse link of mention %s; keeping it unread", nid)
+        return "retry"
 
     index = fetch_feedback_index(info["topic_id"], "Article", info["feedback_id"])
     hit = index.get(info["feedback_id"])
@@ -2418,10 +2410,9 @@ def run_cycle():
             attempts = STATE.data["attempts"].get(nid, 0) + 1
             STATE.data["attempts"][nid] = attempts
             STATE.dirty = True
-            if attempts >= MAX_ATTEMPTS_PER_NOTIF:
-                log.warning("giving up on mention %s after %d attempts (nothing posted)", nid, attempts)
-                STATE.mark_processed(nid)
-                mark_safely(nid)
+            if attempts == MAX_ATTEMPTS_PER_NOTIF:
+                log.warning("mention %s still unanswered after %d attempts; keeping it unread for retry",
+                            nid, attempts)
         STATE.save_if_dirty()
         time.sleep(AI_MIN_GAP_SEC)
 
