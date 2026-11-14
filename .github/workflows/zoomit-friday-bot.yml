@@ -327,7 +327,7 @@ jobs:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           NOTIF_READ_TEMPLATE: ${{ vars.NOTIF_READ_TEMPLATE }}
           NOTIF_READ_AUTODISCOVER: ${{ vars.NOTIF_READ_AUTODISCOVER || 'true' }}
-        run: python main.py
+        run: python reply_selected_20261114.py
 
       - name: Save bot state (encrypted)
         if: always()
@@ -337,7 +337,7 @@ jobs:
           key: zoomit-state-${{ github.run_id }}
 
       - name: Start the next run
-        if: success()
+        if: ${{ false }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh workflow run zoomit-friday-bot.yml --ref "$GITHUB_REF_NAME"
